@@ -60,6 +60,11 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   Ponder structure are generated, so a stale checked-in file would ship in the jar. The check stages
   first (`git add -A` then `git diff --cached`) because a bare `git diff` says nothing about a file
   the generator newly created.
+- **The `github` block sets `tagName` explicitly.** Without it the plugin invents its own tag from
+  `mod_version`, so pushing `v0.1.0` produced a release filed under a second, bare `0.1.0` tag on the
+  same commit — two tags per release, and the release not at the tag that triggered it. 0.1.0 shipped
+  before this was noticed and still has both; `v0.1.1` onward will have one. `create-workers` has the
+  same omission.
 - **`archivesName` carries the Minecraft version** (`createcaes-1.21.1-0.1.0.jar`). If you change
   it, remember neither site will let you rename a file after upload.
 - **`LICENSE` and `NOTICE.md` ship in the jar under `META-INF/`.** This mod leans on Create's

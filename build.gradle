@@ -202,5 +202,11 @@ publishMods {
         repository = github_repository
         accessToken = providers.environmentVariable('GITHUB_TOKEN')
         commitish = providers.environmentVariable('GITHUB_SHA').orElse('dev')
+        // Without this the plugin invents its own tag from mod_version alone, so a `v*` tag push
+        // ends up with the release filed under a second, bare `0.1.0` tag pointing at the same
+        // commit. Two tags per release, and the release is not at the tag that triggered it.
+        tagName = "v${mod_version}"
     }
 }
+
+
