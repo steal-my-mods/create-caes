@@ -11,7 +11,10 @@ and acts as a motor to hand it back when the network runs short.
 ./gradlew runClient          # dev client
 ./gradlew runServer          # dev dedicated server (needs run/eula.txt)
 ./gradlew runGameTestServer  # automated in-world tests -- the real check
+./gradlew publishMods        # upload to CurseForge and GitHub Releases
+./gradlew publishMods -PdryRun=true   # ...or rehearse it without uploading anything
 python3 tools/generate_textures.py   # redraw every block/fluid texture
+python3 tools/generate_ponder.py     # the Ponder structure NBT and its lang keys
 python3 tools/generate_logo.py --size 512 branding/icon-512.png
 ```
 
@@ -35,6 +38,46 @@ of them is published to a public Maven** — Create ships them jar-in-jar. So `b
 `compileOnly` is deliberate: at runtime FML loads them from Create's own jar, and a second copy on
 the runtime classpath makes each mod load twice. Catnip is not a separate artifact — it lives inside
 the Ponder jar, which is where `SuperByteBuffer`, `LangBuilder` and `AngleHelper` come from.
+
+## Distribution
+
+Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), driven by
+`.github/workflows/release.yml` on a `v*` tag. It needs one repository secret, `CURSEFORGE_TOKEN`;
+`GITHUB_TOKEN` is provided by Actions. Things in there that are decisions, not accidents:
+
+- **`minecraft_version_range` is `[1.21.1,1.21.2)`,** not the MDK's default `[1.21.1,1.22)`. This
+  mod is written against Create 6 for 1.21.1 and reads Create's kinetic internals; the wider range
+  would let it install on 1.21.4 and break there instead of refusing.
+- **The changelog drives the release notes.** `publishMods` reads the `CHANGELOG.md` section whose
+  heading names the current `mod_version` and fails if there isn't one — a missing entry should stop
+  a release rather than ship the previous version's notes under a new number. It is wired as a lazy
+  provider so an ordinary `./gradlew build` never trips over it. Both halves verified: `publishMods`
+  fails on a version with no section, `build` does not.
+- **The release workflow checks the tag against `mod_version`.** A tag that disagrees would publish
+  the jar under the wrong number on both sites at once, and neither lets you rename a file after
+  upload.
+- **Both workflows re-run the generators and fail on a diff.** Every texture, the badge and the
+  Ponder structure are generated, so a stale checked-in file would ship in the jar. The check stages
+  first (`git add -A` then `git diff --cached`) because a bare `git diff` says nothing about a file
+  the generator newly created.
+- **`archivesName` carries the Minecraft version** (`createcaes-1.21.1-0.1.0.jar`). If you change
+  it, remember neither site will let you rename a file after upload.
+- **`LICENSE` and `NOTICE.md` ship in the jar under `META-INF/`.** This mod leans on Create's
+  MIT-licensed code heavily — `ConnectivityHandler`, `GeneratingKineticBlockEntity`, the
+  `KineticNetwork` contract, the Steam Engine's tier arithmetic — and MIT wants its notice carried
+  with "copies or substantial portions". A jar handed to a player is a copy. See `NOTICE.md`.
+- **Commits use a repo-local identity** (`Steal-My-Mods`, the account noreply address) set in
+  `.git/config`, deliberately not the global one. Don't "fix" it back. Note the initial commit
+  predates that setting and is authored as the global identity.
+- **CurseForge and GitHub only — Modrinth is deliberately not a destination.** The reasoning is the
+  same as `create-workers`: Modrinth's Content Rules section 6.2 bans project images "created or
+  derived from generative AI output" with no disclosure lane, and every pixel of this mod's art is
+  chosen by `tools/generate_textures.py` and `tools/generate_logo.py`. CurseForge asks only that a
+  *misleading* AI-modified showcase image carry a disclaimer, which a badge of the actual block is
+  not. To restore Modrinth: redraw the art by hand, add a `modrinth_project_id`, re-add the
+  `modrinth` block to `publishMods` **and** `MODRINTH_TOKEN` to `release.yml` — an empty token fails
+  at upload rather than at configuration, which half-publishes a release after CurseForge has
+  already accepted the jar.
 
 ## Architecture landmarks
 
