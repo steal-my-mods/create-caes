@@ -1,0 +1,64 @@
+name: Build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build
+        run: ./gradlew build
+
+      # GameTests are the real check for this mod -- there is no unit-test suite. The run
+      # directory is gitignored, so the server needs its EULA accepting on a fresh checkout.
+      - name: Accept the EULA for the test server
+        run: |
+          mkdir -p run-gametest
+          echo 'eula=true' > run-gametest/eula.txt
+
+      - name: GameTests
+        run: ./gradlew runGameTestServer
+
+      # The art is generated, so a stale checked-in PNG is a real defect. Regenerating must be a
+      # no-op; if it is not, someone edited a texture by hand or changed the generator and forgot.
+      - name: Generated assets are up to date
+        run: |
+          python3 tools/generate_textures.py
+          python3 tools/generate_ponder.py
+          python3 tools/generate_logo.py
+          python3 tools/generate_logo.py branding/icon-512.png --size 512
+          # Staged, not a bare diff: a generator that starts emitting a new file nobody committed
+          # leaves it untracked, and `git diff` says nothing about untracked files.
+          git add -A
+          git diff --cached --exit-code
+
+      - name: Upload the jar
+        uses: actions/upload-artifact@v5
+        with:
+          name: createcaes-jar
+          path: build/libs/*.jar
+          if-no-files-found: error
+
+      - name: Upload server logs if the tests failed
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: gametest-logs
+          path: run-gametest/logs/
+          if-no-files-found: ignore

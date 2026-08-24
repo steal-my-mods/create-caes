@@ -1,0 +1,8 @@
+{
+  "parent": "minecraft:block/cube_bottom_top",
+  "textures": {
+    "side": "createcaes:block/pressure_vessel_side",
+    "top": "createcaes:block/pressure_vessel_side",
+    "bottom": "createcaes:block/pressure_vessel_side"
+  }
+}

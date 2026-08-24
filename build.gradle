@@ -1,0 +1,150 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'net.neoforged.moddev' version '2.0.144'
+}
+
+version = mod_version
+group = mod_group_id
+
+base {
+    // The Minecraft version belongs in the file name: a player with three of these in a
+    // downloads folder has nothing else to tell them apart.
+    archivesName = "${mod_id}-${minecraft_version}"
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+    withSourcesJar()
+}
+
+repositories {
+    mavenLocal()
+    maven {
+        name = 'Create / Catnip / Ponder / Flywheel'
+        url = 'https://maven.createmod.net'
+    }
+    maven {
+        name = 'NeoForged'
+        url = 'https://maven.neoforged.net/releases'
+    }
+    mavenCentral()
+}
+
+neoForge {
+    version = project.neo_version
+
+    parchment {
+        minecraftVersion = project.parchment_minecraft_version
+        mappingsVersion = project.parchment_mappings_version
+    }
+
+    runs {
+        configureEach {
+            gameDirectory = project.file('run')
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+        client {
+            client()
+        }
+        server {
+            server()
+            programArgument '--nogui'
+        }
+        gameTestServer {
+            type = 'gameTestServer'
+            gameDirectory = project.file('run-gametest')
+        }
+    }
+
+    mods {
+        "${project.mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+// Create declares Registrate / Ponder / Flywheel as Maven dependencies but no 1.21.1
+// build of them is published to any public repository -- Create ships them as jar-in-jar
+// instead. So resolve Create without transitives and unpack its embedded jars onto the
+// compile classpath. These must stay compileOnly: at runtime FML loads them straight out
+// of Create's own jar, and a second copy on the runtime classpath loads each mod twice.
+def createCoordinate = "com.simibubi.create:create-1.21.1:${create_version}"
+def createJijDir = layout.buildDirectory.dir('create-jij').get().asFile
+
+configurations {
+    createArtifact {
+        canBeConsumed = false
+        canBeResolved = true
+        transitive = false
+    }
+}
+
+def unpackCreateJij = tasks.register('unpackCreateJij', Sync) {
+    description = "Unpacks Registrate/Ponder/Flywheel out of Create's jar-in-jar bundle"
+    from({ zipTree(configurations.createArtifact.singleFile) }) {
+        include 'META-INF/jarjar/*.jar'
+        eachFile { fcd -> fcd.relativePath = new RelativePath(true, fcd.name) }
+        includeEmptyDirs = false
+    }
+    into createJijDir
+}
+
+def createJijJars = fileTree(createJijDir) { include '*.jar' }
+createJijJars.builtBy(unpackCreateJij)
+
+dependencies {
+    createArtifact(createCoordinate) { transitive = false }
+
+    // Create 6.0 for 1.21.1 (NeoForge)
+    implementation(createCoordinate) { transitive = false }
+
+    // Registrate, Ponder, Flywheel -- unpacked from Create above
+    compileOnly createJijJars
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            neo_version            : neo_version,
+            neo_version_range      : neo_version_range,
+            loader_version_range   : loader_version_range,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+            mod_authors            : mod_authors,
+            mod_description        : mod_description,
+            create_version_range   : create_version_range,
+    ]
+    inputs.properties replaceProperties
+    filesMatching(['META-INF/neoforge.mods.toml']) {
+        expand replaceProperties
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+}
+
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven { url = "file://${project.projectDir}/repo" }
+    }
+}
+
+// The licence and the third-party notices travel inside the jar. MIT asks for its notice to
+// be included in "copies or substantial portions", and a jar handed to a player is a copy --
+// Create's multiblock and kinetic contracts are leaned on heavily here, so Create's notice
+// has to be too.
+tasks.named('jar', Jar).configure {
+    from(file('LICENSE')) { into 'META-INF' }
+    from(file('NOTICE.md')) { into 'META-INF' }
+}

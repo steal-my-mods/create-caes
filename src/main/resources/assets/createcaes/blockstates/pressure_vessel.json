@@ -1,0 +1,16 @@
+{
+  "variants": {
+    "top=true,bottom=true": {
+      "model": "createcaes:block/pressure_vessel_single"
+    },
+    "top=true,bottom=false": {
+      "model": "createcaes:block/pressure_vessel_top"
+    },
+    "top=false,bottom=true": {
+      "model": "createcaes:block/pressure_vessel_bottom"
+    },
+    "top=false,bottom=false": {
+      "model": "createcaes:block/pressure_vessel_middle"
+    }
+  }
+}

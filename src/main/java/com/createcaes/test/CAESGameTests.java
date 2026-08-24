@@ -1,0 +1,911 @@
+package com.createcaes.test;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.List;
+
+import com.createcaes.CAESConfig;
+import com.createcaes.CreateCAES;
+import com.createcaes.engine.AirEngineBlock;
+import com.createcaes.engine.AirEngineBlockEntity;
+import com.createcaes.engine.EngineMode;
+import com.createcaes.registry.CAESBlocks;
+import com.createcaes.registry.CAESItems;
+import com.createcaes.registry.CAESFluids;
+import com.createcaes.vessel.PressureVesselBlock;
+import com.createcaes.vessel.PressureVesselBlockEntity;
+import com.simibubi.create.AllBlocks;
+import com.simibubi.create.content.kinetics.base.KineticBlockEntity;
+import com.simibubi.create.content.kinetics.motor.CreativeMotorBlockEntity;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.gametest.framework.GameTest;
+import net.minecraft.gametest.framework.GameTestAssertException;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NbtAccounter;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.Tag;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.properties.Property;
+import net.minecraft.gametest.framework.GameTestHelper;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.context.BlockPlaceContext;
+import net.minecraft.world.item.context.UseOnContext;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.neoforged.neoforge.fluids.FluidStack;
+import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
+import net.neoforged.neoforge.gametest.GameTestHolder;
+import net.neoforged.neoforge.gametest.PrefixGameTestTemplate;
+
+/**
+ * The rig is always the same line of blocks: a driver, then the engine, then the vessel it is
+ * bolted to. What changes between tests is which driver is on the shaft side and how much air the
+ * vessel starts with, because those two are exactly what the engine reads when it picks a mode.
+ */
+@GameTestHolder(CreateCAES.ID)
+@PrefixGameTestTemplate(false)
+public class CAESGameTests {
+
+	private static final int SITE_SIZE = 11;
+
+	/** Shaft side, engine, vessel — west to east. */
+	private static final BlockPos DRIVER = new BlockPos(2, 1, 5);
+	private static final BlockPos ENGINE = new BlockPos(3, 1, 5);
+	private static final BlockPos VESSEL = new BlockPos(4, 1, 5);
+
+	/** Past the engine's warm-up, with room for the rotation propagator to settle. */
+	private static final int SETTLE_TICKS = 12;
+
+	// --- compressing ---------------------------------------------------------------------------
+
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void surplusPowerFillsTheVessel(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+
+		helper.runAfterDelay(SETTLE_TICKS + 20, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			helper.assertTrue(engine.getMode() == EngineMode.COMPRESSING,
+				"engine should be compressing off a creative motor's surplus, was " + engine.getMode());
+			helper.assertTrue(air(helper) > 0,
+				"the vessel should have gained air, holds " + air(helper) + "mB");
+			helper.succeed();
+		});
+	}
+
+	/** A compressor with nowhere to put air must stop drawing, not keep spinning against a full tank. */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void aFullVesselStopsTheCompressor(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+		fill(helper, Integer.MAX_VALUE);
+
+		helper.runAfterDelay(SETTLE_TICKS + 10, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			helper.assertTrue(engine.getMode() == EngineMode.IDLE,
+				"a full vessel should leave the engine idle, was " + engine.getMode());
+			helper.assertTrue(engine.calculateStressApplied() == 0,
+				"an idle engine must place no load on the network");
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * The property the whole design turns on. An engine that tested the network's balance
+	 * <em>including</em> its own contribution would compress, see the deficit it just created,
+	 * generate, see the surplus it just created, and compress again — once a tick, for ever. This
+	 * asserts the mode settles and then stays put.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 300)
+	public static void theEngineSettlesOnOneModeRatherThanFlipping(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+
+		List<EngineMode> seen = new ArrayList<>();
+		helper.startSequence()
+			.thenIdle(SETTLE_TICKS)
+			.thenExecuteFor(80, () -> seen.add(engine(helper).getMode()))
+			.thenExecute(() -> {
+				long changes = 0;
+				for (int i = 1; i < seen.size(); i++)
+					if (seen.get(i) != seen.get(i - 1))
+						changes++;
+				helper.assertTrue(changes == 0,
+					"the mode changed " + changes + " times in 80 settled ticks: " + seen);
+				helper.assertTrue(seen.get(0) == EngineMode.COMPRESSING,
+					"expected it to have settled on compressing, got " + seen.get(0));
+			})
+			.thenSucceed();
+	}
+
+	/**
+	 * The mechanism behind the test above, asserted directly. A creative motor has so much capacity
+	 * to spare that a mode flip would not actually show up in {@code settlesOnOneMode}; what would
+	 * show up on a marginal network is measuring the wrong quantity, so measure that instead. While
+	 * the compressor is drawing 512su the engine must read the rest of the network's load as exactly
+	 * zero, because it is the only load there is.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void theCompressorDoesNotSeeItsOwnDraw(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+
+		helper.runAfterDelay(SETTLE_TICKS + 10, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			helper.assertTrue(engine.getMode() == EngineMode.COMPRESSING,
+				"expected it to be compressing, was " + engine.getMode());
+			helper.assertTrue(engine.calculateStressApplied() > 0,
+				"a compressing engine must actually be loading the network");
+			helper.assertTrue(engine.networkStressWithoutSelf() == 0,
+				"the engine is the only load on this network, so everything else's stress must read "
+					+ "as zero; it read " + engine.networkStressWithoutSelf());
+			helper.assertTrue(engine.networkCapacityWithoutSelf() > 0,
+				"the motor's capacity should still be visible");
+			helper.succeed();
+		});
+	}
+
+	// --- generating ----------------------------------------------------------------------------
+
+	/** With no other source on the network, stored air is what turns the shaft. */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void storedAirDrivesTheShaft(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.ENCASED_FAN.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.WEST));
+		fill(helper, 8000);
+		int before = air(helper);
+
+		helper.runAfterDelay(SETTLE_TICKS + 20, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			helper.assertTrue(engine.getMode() == EngineMode.GENERATING,
+				"the engine should be generating off stored air, was " + engine.getMode());
+			helper.assertTrue(engine.getSpeed() != 0,
+				"a generating engine should be turning");
+
+			KineticBlockEntity fan = helper.getBlockEntity(DRIVER);
+			helper.assertTrue(fan.getSpeed() != 0,
+				"the load on the shaft should be turning too");
+			helper.assertTrue(!fan.isOverStressed(),
+				"the engine's capacity should be covering the load rather than the network failing");
+			helper.assertTrue(air(helper) < before,
+				"generating should have spent air; still holds " + air(helper) + "mB of " + before);
+			helper.succeed();
+		});
+	}
+
+	/** No air, no torque — and specifically no free rotation. */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void anEmptyVesselDrivesNothing(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.ENCASED_FAN.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.WEST));
+
+		helper.runAfterDelay(SETTLE_TICKS + 10, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			helper.assertTrue(engine.getMode() == EngineMode.IDLE,
+				"an empty vessel should leave the engine idle, was " + engine.getMode());
+			helper.assertTrue(engine.getSpeed() == 0,
+				"an idle engine must not be turning, was " + engine.getSpeed());
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * The engine burns air even when the shaft is unloaded. Without this floor a charged vessel is a
+	 * perpetual motion machine: rotation for nothing, for ever.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void anUnloadedMotorStillSpendsAir(GameTestHelper helper) {
+		rig(helper);
+		// A bare shaft: it turns, but it asks nothing of the network.
+		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		fill(helper, 8000);
+		int before = air(helper);
+
+		helper.runAfterDelay(SETTLE_TICKS + 20, () -> {
+			helper.assertTrue(engine(helper).getMode() == EngineMode.GENERATING,
+				"a bare shaft is still something to drive");
+			helper.assertTrue(air(helper) < before,
+				"spinning a bare shaft should still cost air; " + air(helper) + "mB of " + before);
+			helper.succeed();
+		});
+	}
+
+	/** An engine with nothing on its shaft has no reason to spend anything. */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void anEngineDrivingNothingStaysIdle(GameTestHelper helper) {
+		rig(helper);
+		fill(helper, 8000);
+		int before = air(helper);
+
+		helper.runAfterDelay(SETTLE_TICKS + 20, () -> {
+			helper.assertTrue(engine(helper).getMode() == EngineMode.IDLE,
+				"nothing is attached, so there is nothing to generate for");
+			helper.assertTrue(air(helper) == before,
+				"an idle engine must not leak air");
+			helper.succeed();
+		});
+	}
+
+	/** The same exclusion, the other way round: a motor must not count its own capacity as cover. */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void theMotorDoesNotSeeItsOwnCapacity(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.ENCASED_FAN.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.WEST));
+		fill(helper, 8000);
+
+		helper.runAfterDelay(SETTLE_TICKS + 10, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			helper.assertTrue(engine.getMode() == EngineMode.GENERATING,
+				"expected it to be generating, was " + engine.getMode());
+			helper.assertTrue(engine.calculateAddedStressCapacity() > 0,
+				"a generating engine must actually be supplying capacity");
+			helper.assertTrue(engine.networkCapacityWithoutSelf() == 0,
+				"nothing else on this network generates, so capacity-without-self must be zero; it read "
+					+ engine.networkCapacityWithoutSelf());
+			helper.assertTrue(engine.networkStressWithoutSelf() > 0,
+				"the fan's load should still be visible; it read " + engine.networkStressWithoutSelf());
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * The economic invariant, and the reason {@link CAESConfig#chargeMarginStress()} exists at all.
+	 * Two engines back to back on one shaft, one generating and one compressing, would be a machine
+	 * that makes air out of the air it is spending. The margin is what refuses it: a compressor
+	 * needs strictly <em>more</em> spare capacity than it will draw, and a motor of the same rating
+	 * supplies exactly as much as the compressor wants.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 300)
+	public static void twoEnginesOnOneShaftCannotChargeEachOther(GameTestHelper helper) {
+		floor(helper);
+
+		// The charged half: vessel, engine facing it, shaft to the west.
+		helper.setBlock(VESSEL, CAESBlocks.PRESSURE_VESSEL.get()
+			.defaultBlockState());
+		helper.setBlock(ENGINE, CAESBlocks.AIR_ENGINE.get()
+			.defaultBlockState()
+			.setValue(AirEngineBlock.FACING, Direction.EAST));
+		fill(helper, 8000);
+
+		// The empty half: the same shaft, an engine facing the other way, its own vessel.
+		BlockPos shaft = DRIVER;
+		BlockPos otherEngine = new BlockPos(1, 1, 5);
+		BlockPos otherVessel = new BlockPos(0, 1, 5);
+		helper.setBlock(shaft, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		helper.setBlock(otherEngine, CAESBlocks.AIR_ENGINE.get()
+			.defaultBlockState()
+			.setValue(AirEngineBlock.FACING, Direction.WEST));
+		helper.setBlock(otherVessel, CAESBlocks.PRESSURE_VESSEL.get()
+			.defaultBlockState());
+
+		int startingAir = 8000;
+		helper.runAfterDelay(SETTLE_TICKS + 60, () -> {
+			AirEngineBlockEntity driving = engine(helper);
+			AirEngineBlockEntity leeching = helper.getBlockEntity(otherEngine);
+			PressureVesselBlockEntity target = ((PressureVesselBlockEntity) helper.getBlockEntity(otherVessel))
+				.getControllerBE();
+
+			helper.assertTrue(driving.getMode() == EngineMode.GENERATING,
+				"the charged engine should be driving the shaft, was " + driving.getMode());
+			helper.assertTrue(leeching.getMode() != EngineMode.COMPRESSING,
+				"the second engine must not compress off the first one's output, was "
+					+ leeching.getMode());
+			helper.assertTrue(target.getTankInventory()
+				.getFluidAmount() == 0,
+				"no air should have appeared in the second vessel, it holds " + target.getTankInventory()
+					.getFluidAmount() + "mB");
+			helper.assertTrue(air(helper) < startingAir,
+				"and the first vessel should be paying for the rotation");
+			helper.succeed();
+		});
+	}
+
+	// --- tiers ------------------------------------------------------------------------------
+
+	/** Vessel size picks the speed tier, the way boiler size picks the Steam Engine's. */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void vesselSizeSetsTheSpeedTier(GameTestHelper helper) {
+		floor(helper);
+		helper.setBlock(VESSEL, vessel());
+		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
+
+		helper.runAfterDelay(SETTLE_TICKS + 12, () -> {
+			AirEngineBlockEntity small = engine(helper);
+			helper.assertTrue(small.getSpeedTier() == 1,
+				"one block of vessel is the bottom tier, got " + small.getSpeedTier());
+
+			// Grow it to a full 3x3x1 slab: one engine's worth at the default nine blocks each.
+			for (int x = 0; x < 3; x++)
+				for (int z = -1; z < 2; z++)
+					helper.setBlock(VESSEL.offset(x, 0, z), vessel());
+
+			helper.runAfterDelay(24, () -> {
+				AirEngineBlockEntity full = engine(helper);
+				helper.assertTrue(full.getSpeedTier() == 4,
+					"nine blocks should reach the top tier, got " + full.getSpeedTier()
+						+ " at efficiency " + full.getEfficiency());
+				helper.succeed();
+			});
+		});
+	}
+
+	/** Two engines on one vessel split it, exactly as two Steam Engines split an undersized boiler. */
+	@GameTest(template = "test_rig", timeoutTicks = 250)
+	public static void enginesShareAVesselTheWayTheyShareABoiler(GameTestHelper helper) {
+		floor(helper);
+		for (int x = 0; x < 3; x++)
+			for (int z = -1; z < 2; z++)
+				helper.setBlock(VESSEL.offset(x, 0, z), vessel());
+
+		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
+
+		helper.runAfterDelay(SETTLE_TICKS + 12, () -> {
+			float alone = engine(helper).getRatedStress();
+			helper.assertTrue(engine(helper).getSpeedTier() == 4,
+				"one engine on nine blocks should be at the top tier");
+
+			// A second engine on the far face of the same vessel.
+			BlockPos other = VESSEL.offset(3, 0, 0);
+			helper.setBlock(other, engineFacing(Direction.WEST));
+
+			helper.runAfterDelay(24, () -> {
+				AirEngineBlockEntity first = engine(helper);
+				AirEngineBlockEntity second = helper.getBlockEntity(other);
+				helper.assertTrue(first.getSpeedTier() == 3 && second.getSpeedTier() == 3,
+					"sharing should drop both to tier 3, got " + first.getSpeedTier() + " and "
+						+ second.getSpeedTier());
+				float shared = first.getRatedStress() + second.getRatedStress();
+				helper.assertTrue(Math.abs(shared - alone) < 1.0F,
+					"two engines sharing a vessel should be worth what one engine was: " + shared
+						+ " against " + alone);
+				helper.succeed();
+			});
+		});
+	}
+
+	/**
+	 * A generating engine declares one of the four tier speeds, and which one is decided by the
+	 * vessel. Neither a fixed configured RPM nor the speed the shaft happens to be turning at would
+	 * satisfy this at both sizes; the previous design used the latter and fell back to the former.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 250)
+	public static void aGeneratingEngineDeclaresItsTierSpeed(GameTestHelper helper) {
+		floor(helper);
+		helper.setBlock(VESSEL, vessel());
+		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
+		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		fill(helper, 8000);
+
+		helper.runAfterDelay(SETTLE_TICKS + 12, () -> {
+			AirEngineBlockEntity small = engine(helper);
+			helper.assertTrue(small.getMode() == EngineMode.GENERATING,
+				"the small rig should be generating, it is " + small.getMode());
+			helper.assertTrue(Math.abs(small.getGeneratedSpeed()) == 16 * small.getSpeedTier(),
+				"tier " + small.getSpeedTier() + " should declare " + (16 * small.getSpeedTier())
+					+ " RPM, it declares " + Math.abs(small.getGeneratedSpeed()));
+			helper.assertTrue(Math.abs(small.getGeneratedSpeed()) == 16,
+				"a one-block vessel is tier 1, so 16 RPM, not " + Math.abs(small.getGeneratedSpeed()));
+
+			// Grow the vessel under it and the declared speed must climb with the tier.
+			for (int x = 0; x < 3; x++)
+				for (int z = -1; z < 2; z++)
+					helper.setBlock(VESSEL.offset(x, 0, z), vessel());
+			fill(helper, 40000);
+
+			helper.runAfterDelay(24, () -> {
+				AirEngineBlockEntity big = engine(helper);
+				helper.assertTrue(Math.abs(big.getGeneratedSpeed()) == 16 * big.getSpeedTier(),
+					"tier " + big.getSpeedTier() + " should declare " + (16 * big.getSpeedTier())
+						+ " RPM, it declares " + Math.abs(big.getGeneratedSpeed()));
+				helper.assertTrue(Math.abs(big.getGeneratedSpeed()) == 64,
+					"nine blocks is tier 4, so 64 RPM, not " + Math.abs(big.getGeneratedSpeed()));
+				helper.succeed();
+			});
+		});
+	}
+
+	/**
+	 * Failover must not change how fast the factory runs. A tier-4 engine can drive a dead network at
+	 * 64 RPM, but taking over an 8 RPM one at 64 would multiply every belt speed and every consumer's
+	 * draw by eight the instant the source died. The tier is a ceiling, not a target.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 300)
+	public static void failoverHoldsTheSpeedTheNetworkWasRunningAt(GameTestHelper helper) {
+		floor(helper);
+		// Nine blocks, so the engine is tier 4 and could drive at 64 if it wanted to.
+		for (int x = 0; x < 3; x++)
+			for (int z = -1; z < 2; z++)
+				helper.setBlock(VESSEL.offset(x, 0, z), vessel());
+		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
+		// A shaft the engine still has something to drive after the motor goes.
+		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		BlockPos motor = DRIVER.west();
+		helper.setBlock(motor, AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+		helper.runAfterDelay(2, () -> ((CreativeMotorBlockEntity) helper.getBlockEntity(motor))
+			.generatedSpeed.setValue(8));
+		fill(helper, 40000);
+
+		helper.runAfterDelay(SETTLE_TICKS + 20, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			helper.assertTrue(engine.getSpeedTier() == 4,
+				"the rig needs a tier 4 engine, it is tier " + engine.getSpeedTier());
+			helper.assertTrue(Math.abs(engine.getTheoreticalSpeed()) == 8,
+				"the rig needs the network at 8 RPM, it is at " + engine.getTheoreticalSpeed());
+
+			helper.destroyBlock(motor);
+
+			helper.runAfterDelay(24, () -> {
+				AirEngineBlockEntity after = engine(helper);
+				helper.assertTrue(after.getMode() == EngineMode.GENERATING,
+					"the engine should have taken over, it is " + after.getMode());
+				helper.assertTrue(Math.abs(after.getGeneratedSpeed()) == 8,
+					"failover changed the network speed: it was 8 RPM and the engine now declares "
+						+ Math.abs(after.getGeneratedSpeed()));
+				helper.succeed();
+			});
+		});
+	}
+
+	/**
+	 * The other half of the cap. Remembering the network's speed must not let a geared-up network
+	 * raise what the engine is worth: a tier-1 engine that inherited 64 RPM would supply four times
+	 * its rating, which is the gearing exploit coming back in through the failover path.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 300)
+	public static void aFastNetworkDoesNotRaiseTheCeiling(GameTestHelper helper) {
+		floor(helper);
+		// One block, so tier 1: the engine may never declare more than 16 RPM.
+		helper.setBlock(VESSEL, vessel());
+		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
+		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		BlockPos motor = DRIVER.west();
+		helper.setBlock(motor, AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+		helper.runAfterDelay(2, () -> ((CreativeMotorBlockEntity) helper.getBlockEntity(motor))
+			.generatedSpeed.setValue(64));
+		fill(helper, 4000);
+
+		helper.runAfterDelay(SETTLE_TICKS + 20, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			helper.assertTrue(engine.getSpeedTier() == 1,
+				"the rig needs a tier 1 engine, it is tier " + engine.getSpeedTier());
+			helper.assertTrue(Math.abs(engine.getTheoreticalSpeed()) == 64,
+				"the rig needs the network at 64 RPM, it is at " + engine.getTheoreticalSpeed());
+
+			helper.destroyBlock(motor);
+
+			helper.runAfterDelay(24, () -> {
+				AirEngineBlockEntity after = engine(helper);
+				helper.assertTrue(after.getMode() == EngineMode.GENERATING,
+					"the engine should have taken over, it is " + after.getMode());
+				helper.assertTrue(Math.abs(after.getGeneratedSpeed()) == 16,
+					"a tier 1 engine declared " + Math.abs(after.getGeneratedSpeed())
+						+ " RPM after inheriting a 64 RPM network");
+				float supplied = after.calculateAddedStressCapacity()
+					* Math.abs(after.getGeneratedSpeed());
+				helper.assertTrue(supplied <= after.getRatedStress() + 1,
+					"the engine is supplying " + supplied + "su against a rating of "
+						+ after.getRatedStress());
+				helper.succeed();
+			});
+		});
+	}
+
+	/**
+	 * The regression this model exists for. A generator contributes at the speed it <em>declares</em>,
+	 * not the speed the shaft is spun at, so gearing a network up must not multiply what the engine
+	 * is worth. The previous design declared the network's speed and did exactly that.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 250)
+	public static void ratedOutputDoesNotChangeWithNetworkSpeed(GameTestHelper helper) {
+		floor(helper);
+		helper.setBlock(VESSEL, vessel());
+		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
+		helper.setBlock(DRIVER, AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+
+		helper.runAfterDelay(SETTLE_TICKS + 12, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			float slowRating = engine.getRatedStress();
+			float slowSpeed = Math.abs(engine.getTheoreticalSpeed());
+
+			((CreativeMotorBlockEntity) helper.getBlockEntity(DRIVER)).generatedSpeed.setValue(64);
+
+			helper.runAfterDelay(20, () -> {
+				AirEngineBlockEntity after = engine(helper);
+				float fastSpeed = Math.abs(after.getTheoreticalSpeed());
+				helper.assertTrue(fastSpeed > slowSpeed,
+					"the test needs the network to actually speed up: " + slowSpeed + " then " + fastSpeed);
+				helper.assertTrue(Math.abs(after.getRatedStress() - slowRating) < 1.0F,
+					"a four-fold gearing changed what the engine is worth: " + slowRating + " then "
+						+ after.getRatedStress());
+				helper.succeed();
+			});
+		});
+	}
+
+	/**
+	 * An engine must join a turning shaft, not fight it — the Steam Engine's own flip. Reaching the
+	 * generating path needs the shaft to stop first, because an engine with surplus available has no
+	 * reason to generate: so the rig drives it backwards as a compressor, then pulls the motor. What
+	 * the flip buys is that failover keeps the network turning the way it already was, instead of
+	 * reversing every machine on it.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 250)
+	public static void theEngineFlipsToMatchAShaftAlreadyTurning(GameTestHelper helper) {
+		floor(helper);
+		helper.setBlock(VESSEL, vessel());
+		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
+		// A shaft between motor and engine, so pulling the motor still leaves something to drive.
+		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		BlockPos motor = DRIVER.west();
+		helper.setBlock(motor, AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+		fill(helper, 4000);
+
+		// Drive the shaft against the engine's natural sense.
+		helper.runAfterDelay(2, () -> ((CreativeMotorBlockEntity) helper.getBlockEntity(motor))
+			.generatedSpeed.setValue(-32));
+
+		helper.runAfterDelay(SETTLE_TICKS + 12, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			helper.assertTrue(engine.getTheoreticalSpeed() < 0,
+				"the rig needs the shaft turning negative, it is at " + engine.getTheoreticalSpeed());
+			helper.assertBlockPresent(CAESBlocks.AIR_ENGINE.get(), ENGINE);
+
+			helper.destroyBlock(motor);
+
+			helper.runAfterDelay(24, () -> {
+				AirEngineBlockEntity after = engine(helper);
+				helper.assertTrue(after.getMode() == EngineMode.GENERATING,
+					"with the motor gone the engine should take over, it is " + after.getMode());
+				helper.assertTrue(after.getGeneratedSpeed() < 0,
+					"the engine reversed the network on failover: it declares "
+						+ after.getGeneratedSpeed() + " where the shaft had been turning negative");
+				helper.succeed();
+			});
+		});
+	}
+
+	// --- the vessel ----------------------------------------------------------------------------
+
+	/** Stacking vessels has to pool what is already in them, not strand it or duplicate it. */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void stackedVesselsPoolTheirAir(GameTestHelper helper) {
+		floor(helper);
+		helper.setBlock(VESSEL, CAESBlocks.PRESSURE_VESSEL.get().defaultBlockState());
+		fill(helper, 5000);
+		int single = vessel(helper).getTankInventory()
+			.getCapacity();
+
+		helper.setBlock(VESSEL.above(), CAESBlocks.PRESSURE_VESSEL.get().defaultBlockState());
+
+		helper.runAfterDelay(SETTLE_TICKS, () -> {
+			PressureVesselBlockEntity lower = helper.getBlockEntity(VESSEL);
+			PressureVesselBlockEntity upper = helper.getBlockEntity(VESSEL.above());
+			helper.assertTrue(lower.getController()
+				.equals(upper.getController()), "both blocks should answer to one controller");
+
+			PressureVesselBlockEntity controller = lower.getControllerBE();
+			helper.assertTrue(controller.getTankInventory()
+				.getCapacity() == single * 2,
+				"two blocks should hold twice as much, got " + controller.getTankInventory()
+					.getCapacity());
+			helper.assertTrue(controller.getTankInventory()
+				.getFluidAmount() == 5000,
+				"the air already stored should survive the merge, got " + controller.getTankInventory()
+					.getFluidAmount());
+
+			// The lid and the floor are what stop a stack rendering as identical cubes.
+			helper.assertBlockProperty(VESSEL, PressureVesselBlock.BOTTOM, true);
+			helper.assertBlockProperty(VESSEL, PressureVesselBlock.TOP, false);
+			helper.assertBlockProperty(VESSEL.above(), PressureVesselBlock.TOP, true);
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * The other half of the multiblock, and the half where air could go missing. Create's splitter
+	 * hands the controller one block's worth and spreads the rest over the remaining parts, so a
+	 * three-high vessel broken down to two must still hold everything it held.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void breakingAVesselSplitsTheAirRatherThanLosingIt(GameTestHelper helper) {
+		floor(helper);
+		for (int y = 0; y < 3; y++)
+			helper.setBlock(VESSEL.above(y), CAESBlocks.PRESSURE_VESSEL.get()
+				.defaultBlockState());
+
+		helper.runAfterDelay(2, () -> {
+			fill(helper, 12000);
+			helper.assertTrue(air(helper) == 12000, "the stack should have taken all 12000mB");
+
+			helper.destroyBlock(VESSEL.above(2));
+
+			helper.runAfterDelay(SETTLE_TICKS, () -> {
+				PressureVesselBlockEntity controller = vessel(helper);
+				helper.assertTrue(controller.getTankInventory()
+					.getCapacity() == CAESConfig.vesselCapacity() * 2,
+					"two blocks are left, so capacity should have halved to two blocks' worth; it is "
+						+ controller.getTankInventory()
+							.getCapacity());
+				helper.assertTrue(air(helper) == 12000,
+					"all the air should have survived the split; " + air(helper) + "mB of 12000");
+				helper.succeed();
+			});
+		});
+	}
+
+	/**
+	 * Every footprint shares one height cap, which is the whole point of collapsing the three
+	 * per-footprint caps an earlier version had.
+	 *
+	 * <p>The cap itself is deliberately not asserted behaviourally: it defaults to 32 and the GameTest
+	 * template is six blocks tall, so a test that stacked past it would have to write outside the
+	 * structure box. An earlier version of this test did exactly that, and compared a six-block stack
+	 * against a limit of six — which is to say it asserted nothing at all.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void everyFootprintSharesOneHeightCap(GameTestHelper helper) {
+		floor(helper);
+		helper.setBlock(VESSEL, vessel());
+
+		helper.runAfterDelay(SETTLE_TICKS, () -> {
+			PressureVesselBlockEntity be = vessel(helper);
+			int expected = CAESConfig.vesselMaxHeight();
+			for (int width = 1; width <= 3; width++)
+				helper.assertTrue(be.getMaxLength(Direction.Axis.Y, width) == expected,
+					"a " + width + "x" + width + " vessel is capped at "
+						+ be.getMaxLength(Direction.Axis.Y, width) + ", not the configured " + expected);
+			helper.succeed();
+		});
+	}
+
+	/** A stack within the cap forms to its full height, and the capacity follows the block count. */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void aStackFormsToItsFullHeight(GameTestHelper helper) {
+		floor(helper);
+		// Four blocks: the template's ceiling is y=5 and the vessel starts at y=1, so this is the
+		// tallest stack that stays inside the structure box.
+		int height = 4;
+		for (int y = 0; y < height; y++)
+			helper.setBlock(VESSEL.above(y), vessel());
+
+		helper.runAfterDelay(SETTLE_TICKS, () -> {
+			PressureVesselBlockEntity bottom = vessel(helper);
+			helper.assertTrue(bottom.getHeight() == height,
+				"expected a height of " + height + ", got " + bottom.getHeight());
+			helper.assertTrue(bottom.getTankInventory()
+				.getCapacity() == height * CAESConfig.vesselCapacity(),
+				"capacity should follow the block count, it is " + bottom.getTankInventory()
+					.getCapacity());
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * Once a vessel is wider than one block, placing against its top or bottom face lays the whole
+	 * course. Nine hand-placed blocks per layer is not a mechanic, and a mis-click leaves a vessel
+	 * that quietly refuses to merge.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void placingAgainstAWideVesselLaysAWholeCourse(GameTestHelper helper) {
+		floor(helper);
+		for (int x = 0; x < 2; x++)
+			for (int z = 0; z < 2; z++)
+				helper.setBlock(VESSEL.offset(x, 0, z), vessel());
+
+		helper.runAfterDelay(SETTLE_TICKS, () -> {
+			helper.assertTrue(vessel(helper).getWidth() == 2, "the rig needs a 2x2 to start from");
+
+			// A plain mock player, not makeMockServerPlayerInLevel: that one is a ServerPlayer with
+			// no real connection, and Create tries to sync an edge group to it on placement.
+			Player player = helper.makeMockPlayer(GameType.SURVIVAL);
+			ItemStack stack = new ItemStack(CAESItems.PRESSURE_VESSEL.get(), 16);
+			player.setItemInHand(InteractionHand.MAIN_HAND, stack);
+
+			// Click the top face of one corner: one placement, a whole layer expected.
+			BlockPos clicked = helper.absolutePos(VESSEL);
+			BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(clicked)
+				.add(0, 0.5, 0), Direction.UP, clicked, false);
+			CAESItems.PRESSURE_VESSEL.get()
+				.place(new BlockPlaceContext(new UseOnContext(helper.getLevel(), player,
+					InteractionHand.MAIN_HAND, stack, hit)));
+
+			for (int x = 0; x < 2; x++)
+				for (int z = 0; z < 2; z++)
+					helper.assertBlockPresent(CAESBlocks.PRESSURE_VESSEL.get(),
+						VESSEL.offset(x, 1, z));
+
+			helper.runAfterDelay(SETTLE_TICKS, () -> {
+				helper.assertTrue(vessel(helper).getHeight() == 2,
+					"the new course should have joined the vessel, height is "
+						+ vessel(helper).getHeight());
+				helper.succeed();
+			});
+		});
+	}
+
+	/** A pressure vessel is not a bucket. */
+	@GameTest(template = "test_rig", timeoutTicks = 100)
+	public static void theVesselTakesOnlyCompressedAir(GameTestHelper helper) {
+		floor(helper);
+		helper.setBlock(VESSEL, CAESBlocks.PRESSURE_VESSEL.get().defaultBlockState());
+
+		PressureVesselBlockEntity be = vessel(helper);
+		helper.assertTrue(be.getTankInventory()
+			.fill(new FluidStack(net.minecraft.world.level.material.Fluids.WATER, 1000), FluidAction.EXECUTE) == 0,
+			"water should be refused");
+		helper.assertTrue(be.getTankInventory()
+			.fill(new FluidStack(CAESFluids.COMPRESSED_AIR.get(), 1000), FluidAction.EXECUTE) == 1000,
+			"compressed air should be accepted");
+		helper.succeed();
+	}
+
+	/** Air stored per block has to follow the configured figure, or the balance numbers mean nothing. */
+	@GameTest(template = "test_rig", timeoutTicks = 100)
+	public static void vesselCapacityFollowsTheConfig(GameTestHelper helper) {
+		floor(helper);
+		helper.setBlock(VESSEL, CAESBlocks.PRESSURE_VESSEL.get().defaultBlockState());
+		helper.assertTrue(vessel(helper).getTankInventory()
+			.getCapacity() == CAESConfig.vesselCapacity(),
+			"one block should hold exactly the configured amount");
+		helper.succeed();
+	}
+
+	// --- ponder ------------------------------------------------------------------------------
+
+	/**
+	 * The Ponder structure is generated by {@code tools/generate_ponder.py}, and a scene only loads
+	 * its structure when a player opens it — a typo in a block id or a property name sits there
+	 * silently until then, and the client log says nothing at startup (checked). This parses the
+	 * file the same way the game will and holds every palette entry up against the real registry.
+	 *
+	 * <p>It cannot tell you the scene looks right. It can tell you it will not throw.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 100)
+	public static void thePonderStructureIsValid(GameTestHelper helper) {
+		CompoundTag root;
+		try (InputStream in = CAESGameTests.class
+			.getResourceAsStream("/assets/createcaes/ponder/air_engine.nbt")) {
+			helper.assertTrue(in != null, "the ponder structure is missing from the build");
+			root = NbtIo.readCompressed(in, NbtAccounter.unlimitedHeap());
+		} catch (IOException e) {
+			throw new GameTestAssertException("the ponder structure would not parse: " + e);
+		}
+
+		ListTag palette = root.getList("palette", Tag.TAG_COMPOUND);
+		helper.assertTrue(!palette.isEmpty(), "the structure has an empty palette");
+
+		Set<String> seen = new HashSet<>();
+		for (int i = 0; i < palette.size(); i++) {
+			CompoundTag entry = palette.getCompound(i);
+			String name = entry.getString("Name");
+			seen.add(name);
+			ResourceLocation id = ResourceLocation.parse(name);
+			helper.assertTrue(BuiltInRegistries.BLOCK.containsKey(id), "no such block: " + name);
+
+			Block block = BuiltInRegistries.BLOCK.get(id);
+			CompoundTag properties = entry.getCompound("Properties");
+			for (String key : properties.getAllKeys()) {
+				Property<?> property = block.getStateDefinition()
+					.getProperty(key);
+				helper.assertTrue(property != null, name + " has no property '" + key + "'");
+				helper.assertTrue(property.getValue(properties.getString(key))
+					.isPresent(),
+					name + "." + key + " rejects '" + properties.getString(key) + "'");
+			}
+		}
+
+		// The scene destroys the motor to show the failover, and narrates over the other three.
+		for (String required : new String[] { "createcaes:air_engine", "createcaes:pressure_vessel",
+			"create:shaft", "create:creative_motor" })
+			helper.assertTrue(seen.contains(required),
+				"the scene needs a " + required + " and the structure has none");
+
+		helper.assertTrue(root.getList("size", Tag.TAG_INT)
+			.size() == 3, "the structure has no size");
+
+		// The vessel has to arrive already formed. A ponder level never runs the connectivity
+		// handler, so a vessel saved without a Controller pointer is a pile of one-block tanks whose
+		// textures will not join -- which is exactly what shipped the first time.
+		ListTag blocks = root.getList("blocks", Tag.TAG_COMPOUND);
+		int controllers = 0;
+		int parts = 0;
+		for (int i = 0; i < blocks.size(); i++) {
+			CompoundTag block = blocks.getCompound(i);
+			String name = palette.getCompound(block.getInt("state"))
+				.getString("Name");
+			if (!name.equals("createcaes:pressure_vessel"))
+				continue;
+			CompoundTag be = block.getCompound("nbt");
+			helper.assertTrue(!be.isEmpty(), "a vessel in the ponder structure has no block entity");
+			helper.assertTrue(be.contains("LastKnownPos"),
+				"a vessel has no LastKnownPos, so Ponder cannot re-anchor its controller");
+			if (be.contains("Controller"))
+				parts++;
+			else {
+				controllers++;
+				helper.assertTrue(be.getInt("Size") > 1 && be.getInt("Height") > 1,
+					"the controller should describe a multi-block vessel");
+			}
+		}
+		helper.assertTrue(controllers == 1,
+			"the scene should contain exactly one vessel controller, found " + controllers);
+		helper.assertTrue(parts == 7, "expected 7 vessel parts around it, found " + parts);
+		helper.succeed();
+	}
+
+	// --- rig -----------------------------------------------------------------------------------
+
+	private static net.minecraft.world.level.block.state.BlockState vessel() {
+		return CAESBlocks.PRESSURE_VESSEL.get()
+			.defaultBlockState();
+	}
+
+	private static net.minecraft.world.level.block.state.BlockState engineFacing(Direction facing) {
+		return CAESBlocks.AIR_ENGINE.get()
+			.defaultBlockState()
+			.setValue(AirEngineBlock.FACING, facing);
+	}
+
+	private static void floor(GameTestHelper helper) {
+		for (int x = 0; x < SITE_SIZE; x++)
+			for (int z = 0; z < SITE_SIZE; z++)
+				helper.setBlock(new BlockPos(x, 0, z), Blocks.POLISHED_ANDESITE);
+	}
+
+	/** Engine facing east into a vessel, its shaft side left open for the test to fill in. */
+	private static void rig(GameTestHelper helper) {
+		floor(helper);
+		helper.setBlock(VESSEL, CAESBlocks.PRESSURE_VESSEL.get().defaultBlockState());
+		helper.setBlock(ENGINE, CAESBlocks.AIR_ENGINE.get().defaultBlockState()
+			.setValue(AirEngineBlock.FACING, Direction.EAST));
+	}
+
+	private static AirEngineBlockEntity engine(GameTestHelper helper) {
+		return helper.getBlockEntity(ENGINE);
+	}
+
+	private static PressureVesselBlockEntity vessel(GameTestHelper helper) {
+		PressureVesselBlockEntity be = helper.getBlockEntity(VESSEL);
+		return be.getControllerBE();
+	}
+
+	private static void fill(GameTestHelper helper, int amount) {
+		vessel(helper).getTankInventory()
+			.fill(new FluidStack(CAESFluids.COMPRESSED_AIR.get(), amount), FluidAction.EXECUTE);
+	}
+
+	private static int air(GameTestHelper helper) {
+		return vessel(helper).getTankInventory()
+			.getFluidAmount();
+	}
+}

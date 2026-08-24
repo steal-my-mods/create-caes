@@ -1,0 +1,27 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "B": {
+      "tag": "c:plates/brass"
+    },
+    "P": {
+      "tag": "c:plates/copper"
+    },
+    "C": {
+      "item": "create:copper_casing"
+    },
+    "S": {
+      "item": "create:shaft"
+    }
+  },
+  "pattern": [
+    " B ",
+    "PCP",
+    " S "
+  ],
+  "result": {
+    "count": 1,
+    "id": "createcaes:air_engine"
+  }
+}

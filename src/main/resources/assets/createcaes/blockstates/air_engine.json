@@ -1,0 +1,30 @@
+{
+  "variants": {
+    "facing=up": {
+      "model": "createcaes:block/air_engine"
+    },
+    "facing=down": {
+      "model": "createcaes:block/air_engine",
+      "x": 180
+    },
+    "facing=north": {
+      "model": "createcaes:block/air_engine",
+      "x": 90
+    },
+    "facing=south": {
+      "model": "createcaes:block/air_engine",
+      "x": 90,
+      "y": 180
+    },
+    "facing=east": {
+      "model": "createcaes:block/air_engine",
+      "x": 90,
+      "y": 90
+    },
+    "facing=west": {
+      "model": "createcaes:block/air_engine",
+      "x": 90,
+      "y": 270
+    }
+  }
+}

@@ -1,0 +1,38 @@
+# Gradle
+.gradle/
+build/
+out/
+classes/
+
+# Minecraft dev runs
+run/
+runs/
+run-*/
+logs/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+bin/
+eclipse/
+
+# Claude Code local state. CLAUDE.md at the repo root is deliberately tracked; anything
+# else under .claude/ is per-machine scratch, worktrees included.
+.claude/worktrees/
+.claude/settings.local.json
+
+# OS
+.DS_Store
+
+# Local publish target
+repo/
+
+# Python tooling
+__pycache__/
+*.pyc
