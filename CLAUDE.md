@@ -60,6 +60,19 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   Ponder structure are generated, so a stale checked-in file would ship in the jar. The check stages
   first (`git add -A` then `git diff --cached`) because a bare `git diff` says nothing about a file
   the generator newly created.
+- **The CurseForge token is checked with curl before anything is built.** `publishMods` uploads to two
+  sites, and a missing or expired token fails at *upload* — by which point GitHub may already have
+  accepted the release, leaving a version published on one site and not the other, with no way to
+  rename or replace a file on either. A few seconds of curl against the upload API's cheapest
+  authenticated GET turns that into a failure before anything has shipped anywhere. The status codes
+  were measured against the real API rather than assumed: 200 valid, **400 malformed**, 401 absent.
+  All three fail the release as a bad token; anything else fails it as "could not reach CurseForge",
+  because a 502 is not a bad secret.
+- **Running the release workflow by hand rehearses by default.** `workflow_dispatch` has a `dry_run`
+  input defaulting to true, so a manual trigger runs the whole path — token check, build, tests,
+  generator diff, changelog lookup — and writes what it *would* have uploaded instead of uploading it.
+  A tag push always publishes for real. Without the default, a curious click on "Run workflow" from
+  `dev` publishes whatever `mod_version` currently says, over a version already on CurseForge.
 - **The `github` block sets `tagName` explicitly.** Without it the plugin invents its own tag from
   `mod_version`, so pushing `v0.1.0` produced a release filed under a second, bare `0.1.0` tag on the
   same commit — two tags per release, and the release not at the tag that triggered it. 0.1.0 shipped
