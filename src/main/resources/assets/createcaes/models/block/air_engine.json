@@ -4,13 +4,14 @@
     "particle": "createcaes:block/air_engine_side",
     "side": "createcaes:block/air_engine_side",
     "port": "createcaes:block/air_engine_port",
-    "back": "createcaes:block/air_engine_back"
+    "back": "createcaes:block/air_engine_back",
+    "shoulder": "createcaes:block/air_engine_shoulder"
   },
   "elements": [
     {
       "from": [
         2,
-        0,
+        6,
         2
       ],
       "to": [
@@ -20,14 +21,13 @@
       ],
       "faces": {
         "down": {
-          "texture": "#back",
+          "texture": "#shoulder",
           "uv": [
             0,
             0,
             16,
             16
-          ],
-          "cullface": "down"
+          ]
         },
         "up": {
           "texture": "#port",
@@ -45,7 +45,7 @@
             0,
             0,
             16,
-            16
+            10
           ]
         },
         "south": {
@@ -54,7 +54,7 @@
             0,
             0,
             16,
-            16
+            10
           ]
         },
         "west": {
@@ -63,7 +63,7 @@
             0,
             0,
             16,
-            16
+            10
           ]
         },
         "east": {
@@ -71,6 +71,75 @@
           "uv": [
             0,
             0,
+            16,
+            10
+          ]
+        }
+      }
+    },
+    {
+      "from": [
+        2,
+        0,
+        2
+      ],
+      "to": [
+        14,
+        2,
+        14
+      ],
+      "faces": {
+        "down": {
+          "texture": "#back",
+          "uv": [
+            0,
+            0,
+            16,
+            16
+          ],
+          "cullface": "down"
+        },
+        "up": {
+          "texture": "#shoulder",
+          "uv": [
+            0,
+            0,
+            16,
+            16
+          ]
+        },
+        "north": {
+          "texture": "#side",
+          "uv": [
+            0,
+            14,
+            16,
+            16
+          ]
+        },
+        "south": {
+          "texture": "#side",
+          "uv": [
+            0,
+            14,
+            16,
+            16
+          ]
+        },
+        "west": {
+          "texture": "#side",
+          "uv": [
+            0,
+            14,
+            16,
+            16
+          ]
+        },
+        "east": {
+          "texture": "#side",
+          "uv": [
+            0,
+            14,
             16,
             16
           ]

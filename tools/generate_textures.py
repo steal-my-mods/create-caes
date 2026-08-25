@@ -315,20 +315,49 @@ def vessel_cap():
 
 
 def engine_side():
-    """Gunmetal housing with a brass band where the flywheel runs."""
+    """Gunmetal housing, brass-lipped where it opens out for the flywheel.
+
+    The model splits this face in two and samples it 1:1 against world height: the body covers
+    rows 0..9 (world y 6..16) and the foot covers rows 14..15 (world y 0..2). Rows 10..13 are the
+    open band the flywheel turns in and are never drawn -- they are filled with the cavity tone
+    so that reading the texture shows where the recess is.
+    """
     px = canvas(16, 16, GUNMETAL)
     grain(px, 16, 16, 11, 5)
 
     hline(px, 16, 0, GUNMETAL_LIGHT)
     hline(px, 16, 15, GUNMETAL_DARK)
 
-    # The band sits at the height the flywheel is modelled at, so the two read as one machine.
-    for y, colour in ((10, BRASS_DARK), (11, BRASS), (12, BRASS_LIGHT), (13, BRASS_DARK)):
-        hline(px, 16, y, colour)
+    # The two lips the recess opens between. Brass, so they read as one machine with the wheel
+    # turning between them: row 9 is the underside of the body, row 14 the top of the foot.
+    hline(px, 16, 9, BRASS_DARK)
+    hline(px, 16, 14, BRASS_DARK)
+
+    # Never sampled by any face -- the recess, drawn so the unused rows are not a mystery.
+    rect(px, 16, 0, 10, 16, 14, (20, 22, 26, 255))
 
     rect(px, 16, 2, 3, 14, 8, GUNMETAL_DARK)
     rect(px, 16, 3, 4, 13, 7, shade(GUNMETAL, -4))
     rivets(px, 16, (2,), (1, 14), (24, 27, 31, 255), GUNMETAL_LIGHT)
+    return px
+
+
+def engine_shoulder():
+    """The horizontal faces the recess opens between, seen edge-on through the gap.
+
+    A bearing seat: gunmetal with a brass ring where the axle passes through. Both the underside
+    of the body and the top of the foot use it, so the recess looks machined from both sides.
+    """
+    px = canvas(16, 16, GUNMETAL_DARK)
+    grain(px, 16, 16, 23, 4)
+
+    rect(px, 16, 1, 1, 15, 15, GUNMETAL)
+    rect(px, 16, 5, 5, 11, 11, BRASS_DARK)
+    rect(px, 16, 6, 6, 10, 10, BRASS)
+    rect(px, 16, 7, 7, 9, 9, (20, 22, 26, 255))
+
+    for x, y in ((2, 2), (13, 2), (2, 13), (13, 13)):
+        put(px, 16, x, y, (24, 27, 31, 255))
     return px
 
 
@@ -365,7 +394,13 @@ def engine_back():
 
 
 def engine_flywheel():
-    """Brass wheel face with spokes, so the spin is legible when it is turning."""
+    """Brass plate. The spokes are geometry now, not paint.
+
+    The model builds the wheel from eight real bars, so a painted spoke cross would show up
+    stretched across every one of them. Only the web's up and down faces sample the middle, which
+    is why the hub ring and bore are still here; every other face samples the plain patch at
+    rows/columns 1..5.
+    """
     px = canvas(16, 16, BRASS)
     grain(px, 16, 16, 19, 6)
 
@@ -374,8 +409,6 @@ def engine_flywheel():
     rect(px, 16, 0, 0, 1, 16, BRASS_LIGHT)
     rect(px, 16, 15, 0, 16, 16, BRASS_DARK)
 
-    rect(px, 16, 7, 2, 9, 14, BRASS_DARK)
-    rect(px, 16, 2, 7, 14, 9, BRASS_DARK)
     rect(px, 16, 6, 6, 10, 10, BRASS_LIGHT)
     rect(px, 16, 7, 7, 9, 9, (58, 45, 18, 255))
     return px
@@ -414,6 +447,7 @@ TEXTURES = {
     'block/pressure_vessel_side': vessel_side,
     'block/pressure_vessel_cap': vessel_cap,
     'block/air_engine_side': engine_side,
+    'block/air_engine_shoulder': engine_shoulder,
     'block/air_engine_port': engine_port,
     'block/air_engine_back': engine_back,
     'block/air_engine_flywheel': engine_flywheel,

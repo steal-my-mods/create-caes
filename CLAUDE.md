@@ -15,6 +15,7 @@ and acts as a motor to hand it back when the network runs short.
 ./gradlew publishMods -PdryRun=true   # ...or rehearse it without uploading anything
 python3 tools/generate_textures.py   # redraw every block/fluid texture
 python3 tools/generate_ponder.py     # the Ponder structure NBT and its lang keys
+python3 tools/check_models.py        # block models: rotation clearance and z-fighting
 python3 tools/generate_logo.py --size 512 branding/icon-512.png
 ```
 
@@ -114,6 +115,7 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
 | `CAESConfig` | The whole balance, including the one number that ties rotation to air |
 | `tools/generate_textures.py` | Every texture in the mod, including the 64-tile connected-texture sheets |
 | `tools/generate_ponder.py` | The Ponder scene's structure NBT, written from a layout described in code |
+| `tools/check_models.py` | The only check on the block models: rotation clearance and z-fighting |
 
 ## Things that will bite you
 
@@ -196,6 +198,56 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   right for exactly one facing. The renderer negates the spin for the three negative facings,
   because the model's local up axis points along the facing rather than along the positive axis
   Create measures rotation about.
+- **A rotating partial needs an open band to turn in, and a silhouette that does not change as it
+  turns.** Create obeys both rules and 0.1.0 obeyed neither. `millstone/inner.json` is four bars at
+  0/45/90/135 degrees — flat radius 9.00, *sweep* radius 9.12, so the outline barely moves — turning
+  in a band where `millstone/block.json` has no geometry at all; the Flywheel takes the other route
+  and is a real OBJ circle in open air. Ours was a plain four-arm cross plus a 12x12 web turning at
+  `y 2..6` inside a housing that was one solid box `[2,0,2]→[14,16,14]`, wall at radius 6. Measured:
+  sweep radius 8.49 for the web and 8.54 for the arms against that wall, so ~2.5px of web corner and
+  arm passed *through* the housing on every revolution, and the arms left the block altogether. Both
+  halves are load-bearing — the housing is now a `y 0..2` foot and a `y 6..16` body with `y 2..6` open
+  air, and the wheel is four bars at 0/45/90/135 with a worst reach of 7.16 inside the block's 8.
+  Fixing only the silhouette still grinds; opening only the band still z-fights.
+- **What z-fights is coplanar and same-facing, not overlapping — and "draws the same pixels" includes
+  the uv.** Interpenetrating boxes are fine; the depth buffer sorts them out, which is why the axle
+  sits inside its bearings and the piston rod enters the housing without either being a bug. What is
+  never fine is two quads on one plane facing one way that draw *different* pixels. The trap is that
+  sharing a texture is not enough. The first fix here put the web and all four spokes at `y 3..5`, so
+  their top faces were coincident over 32–64 square units, and because the web samples
+  `air_engine_flywheel` at `uv [0,0,16,16]` (the hub bore) while the spokes sample it at
+  `uv [1,1,6,6]` (plain brass), they fought as visibly as two different textures would — which is
+  what was still wrong after the housing was opened up. So every layer now has its own planes: spokes
+  `y 3..5`, web `y 3.25..4.75`, counterweight `y 3.5..4.5`, and the spokes were narrowed to 3 wide to
+  lift their `z` planes off the axle's 6 and 10. Create insets its millstone web the same way and for
+  the same reason — bars `y 6..12`, web `y 6.5..11.5`. Where layers do overlap the thinner one is
+  enclosed in the thicker, so it is hidden rather than fighting, which is also what makes the wheel
+  read as machined rather than flat.
+- **The piston rod stops at `y 13`, not `y 14`, and the stroke is why.** `PISTON_THROW` is 2px, so a
+  rod modelled at `y 10..14` tops out at exactly 16 — the housing's own up face, same normal,
+  different texture. It only shows when there is nothing above the engine to cull that face, which
+  for a pipe-fed engine is the normal case.
+- **A block model allows one rotation per element, and only ±22.5 or ±45 degrees.** Which is why the
+  diagonal spokes are the *same two bars* turned 45 rather than one bar turned 45 and another turned
+  135, and why the counterweight sits at 22.5. Create's millstone does the identical trick. Anything
+  else needs an OBJ.
+- **`air_engine_side` maps 1:1 onto world height and is split across two elements.** The body samples
+  rows 0..9 (`y 6..16`) and the foot rows 14..15 (`y 0..2`); rows 10..13 are the open band and are
+  never drawn by any face. So the brass lips at rows 9 and 14 are load-bearing pixels — move the
+  recess and you must move both the pixels in `engine_side()` and the `uv` on four faces of each
+  element, or the housing's shading slides off its own geometry with nothing to warn you.
+- **`models/item/air_engine.json` is standalone and inlines all ten elements.** It used to parent the
+  block model; now that the housing has a band cut out of it, parenting would show the item as a foot
+  and a body with an empty gap between them. Create's `millstone/item.json` inlines its spinning inner
+  wheel for exactly this reason. It has to be rebuilt whenever the housing or either partial moves,
+  and nothing enforces that but the comment at the top of it.
+- **None of this is testable by GameTest, and `tools/check_models.py` is the substitute.** A dedicated
+  server loads no models at all, and the client logs a *perfectly clean* startup for a model that
+  grinds through itself — it is only wrong to look at. The tool checks the two things arithmetic can
+  see: that every rotating box turns clear of the housing and stays inside the block, and that no two
+  same-facing coplanar quads draw different pixels. All three of the faults above were caught by it
+  and it fails on each of them being put back. It cannot tell you the engine *looks* right — only
+  `./gradlew runClient` can, and the item in hand needs looking at separately from the block.
 - **One height cap for every footprint, matching Create's Fluid Tank.** `getMaxLength` still receives
   the width — the hook supports per-footprint caps and an earlier version used them — but having
   three different ceilings was a rule Create does not have, and the point of this addon is to add as
