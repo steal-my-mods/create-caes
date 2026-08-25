@@ -116,6 +116,7 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
 | `tools/generate_textures.py` | Every texture in the mod, including the 64-tile connected-texture sheets |
 | `tools/generate_ponder.py` | The Ponder scene's structure NBT, written from a layout described in code |
 | `tools/check_models.py` | The only check on the block models: rotation clearance and z-fighting |
+| `tools/generate_logo.py` | The badge, as a pixel sprite on the Create-family disc |
 
 ## Things that will bite you
 
@@ -241,6 +242,20 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   and a body with an empty gap between them. Create's `millstone/item.json` inlines its spinning inner
   wheel for exactly this reason. It has to be rebuilt whenever the housing or either partial moves,
   and nothing enforces that but the comment at the top of it.
+- **The badge is pixel art blown up by a whole number, and that is the whole style.** The subject is
+  drawn on a 16x20 grid at `tools/generate_logo.py`'s own resolution and scaled by `SPRITE_SCALE`,
+  which must stay an integer or the pixels come out rectangular — which is why `--size` insists on a
+  multiple of 256. 0.1.0's badge was smooth vector shapes with a real circular gauge, and it was the
+  only one of the three sibling addons that did not look like it came out of the same game. The disc,
+  the ring, the 46px grid, the 6px stroke and the shadow offset are all the numbers `create-workers`
+  and `create-gravity-batteries` use; keep them in step, because the point of them is that the three
+  sit together on a mods list.
+- **`check_fits` is there because overrunning the disc does not look like a bug.** Growing the sprite
+  a row, or nudging `SPRITE_SCALE` up one, is the obvious way to make the badge bolder, and the
+  failure is that `render()` silently clips the corner nearest the rim flat — which reads as a design
+  choice. So the far corner of every opaque cell is measured against `RADIUS - RING` before anything
+  is drawn. At scale 9 the stroked art reaches 108.7 of 115; scale 10 reaches 120.1 and the guard
+  fires, which was checked rather than assumed.
 - **None of this is testable by GameTest, and `tools/check_models.py` is the substitute.** A dedicated
   server loads no models at all, and the client logs a *perfectly clean* startup for a model that
   grinds through itself — it is only wrong to look at. The tool checks the two things arithmetic can
