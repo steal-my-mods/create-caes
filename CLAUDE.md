@@ -225,6 +225,25 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   against the real registry, and insists the vessel arrives already formed; `CAESClient.checkPonderScenes`
   compiles the scenes headlessly at startup in dev and reports any text Ponder wants a key for that
   I18n has not got. Neither can tell you the scene *looks* right — only opening it can.
+- **Nothing in a ponder scene rotates by itself, and a still scene looks finished.** A ponder level
+  is client-side, and every path that assigns a kinetic speed is server-gated: `KineticBlockEntity`
+  only calls `attachKinetics()` under `!isClientSide`, and `RotationPropagator` bails the same way,
+  so a shaft in a scene never acquires a speed. Create fakes it — `setKineticSpeed` writes the
+  `Speed` float the renderer reads straight back off the block entity — and that method lives on
+  `CreateSceneBuilder`, not on Ponder's own `SceneBuilder`, which is why every Create scene opens by
+  wrapping the builder it is handed. `AirEngineScenes` did not, and shipped 0.1.0 as a still life
+  with captions: motor, shaft and flywheel all frozen, so pulling the motor out changed nothing on
+  screen while the text narrated a failover. The engine's mode has the same shape — `tick()` returns
+  early on the client, so the scene writes `Mode` by hand with `modifyBlockEntityNBT`, and the piston
+  is frozen without it. Unlike Create's scenes ours needs no `setKineticSpeed(everywhere, 0)` first:
+  their structures are captured out of running worlds and arrive carrying real speeds, ours is
+  generated and carries no `Speed` tag at all.
+- **COMPRESSING and GENERATING are visually identical, and that is not yet decided.**
+  `AirEngineRenderer` distinguishes only IDLE from not — the piston freezes, the flywheel is
+  shaft-locked either way — so without goggles a player cannot see which direction a running engine
+  is working in. The scene leans on text and a green/red outline. See the note in Balance about
+  `IdleReason`: diagnostics on the goggles is this mod's established answer, so this may be correct
+  as it stands rather than a gap.
 - **Ponder text is not the string you pass to `.text(...)`.** That string is only the datagen default.
   Ponder resolves every line through I18n against a key it derives itself —
   `<namespace>.ponder.<sceneId>.header` and `.text_N`, numbered from one in call order — and shows
@@ -241,7 +260,18 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   source for `block/` and nothing else, so the Compressed Air sprites need explicit entries in
   `assets/minecraft/atlases/blocks.json` — which is merged across mods, and is exactly why Create
   ships one listing its own fluids. A fluid whose sprite is not stitched renders as missing texture
-  inside a tank and nothing is logged.
+  inside a tank and nothing is logged. Note *whose* tank: the sprites and the translucent render
+  layer are there for Create's Fluid Tank and its pipes, both of which draw their contents and both
+  of which Compressed Air legitimately reaches — a pipe-fed engine is a supported setup. The
+  Pressure Vessel itself never draws anything.
+- **The Pressure Vessel is opaque, unlike Create's Fluid Tank, and that is a decision.** A plain
+  `cube_bottom_top` with opaque caps and sides, no window, and no block entity renderer registered —
+  so it never draws what it holds. A gas at pressure has nothing to look at, which is the same
+  reasoning that gives Compressed Air no block and no bucket. Consequences worth knowing before
+  "fixing" either: there is no point seeding `TankContent` into the Ponder structure, so the scene's
+  air story is text only and that is not a gap in the scene. The fill level is surfaced where this
+  mod surfaces everything else — a goggle percentage and a comparator level, both off
+  `getFillState`.
 - **`ConnectivityHandler.partAt` matches on block entity *type*.** Pressure Vessels therefore form
   their own multiblocks and never merge with Create's Fluid Tanks, even though both implement the
   same interface. That is why subclassing `FluidTankBlockEntity` was not necessary.
