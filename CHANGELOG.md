@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.1
+
+Fixes to what the Air Engine looks like and to the Ponder scene that explains it. Nothing about how
+it works changed, and an 0.1.0 world loads unchanged.
+
+- **The flywheel no longer grinds through its own housing.** The housing was one solid column with
+  the wheel turning inside its wall: about 2.5px of every arm passed through the casing on each
+  revolution, and the arm corners left the block altogether. The housing is now a foot and a body
+  with an open band between them for the wheel to turn in, and the wheel is four bars whose
+  silhouette barely changes as it turns -- the two rules Create's own Millstone follows. Each layer
+  of the wheel sits on its own plane, so the hub no longer flickers against the spokes, and the
+  housing's brass band is real geometry rather than paint.
+- **The Air Engine item has its own model.** With a band cut out of the housing, inheriting the
+  block model showed the item in hand as a foot and a body with an empty gap between them.
+- **The piston rod stops a pixel short of the top**, so a full stroke no longer fights the housing's
+  own face on an engine with nothing stacked above it -- which for a pipe-fed engine is the normal
+  case.
+- **The Ponder scene moves.** The motor, the shaft and the flywheel were frozen for the whole scene,
+  so pulling the motor out changed nothing on screen while the text narrated a failover, and the
+  piston never stroked. They now turn, the engine holds the speed across the handover the way it
+  really does, and its mode flips on the beat the caption describes.
+- **A new badge**, redrawn as pixel art on the same disc its sibling addons use, so the mod looks
+  like it came out of the game it is for.
+
 ## 0.1.0
 
 First release. Compressed Air Energy Storage for Create.
