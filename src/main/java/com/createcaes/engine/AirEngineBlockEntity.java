@@ -79,6 +79,39 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 	/** Base RPM of the lowest tier. Tiers are multiples of it, as with the Steam Engine. */
 	private static final int TIER_RPM = 16;
 
+	/**
+	 * Ticks an engine waits, after a discharge stops for want of air, before trying again.
+	 *
+	 * <p>Not a cosmetic delay. Dropping out of GENERATING takes {@link #getGeneratedSpeed()} from
+	 * non-zero to zero, and with nothing else driving the shaft that is the expensive branch of
+	 * Create's {@code applyNewSpeed}: {@code detachKinetics} sends {@code RotationPropagator}'s
+	 * {@code propagateMissingSource} over the whole network, calling {@code sendData} on every
+	 * member it walks, and the next attempt runs {@code attachKinetics} to build all of it back
+	 * again. {@code refreshKineticContribution} then recomputes the network's stress, and
+	 * {@code KineticNetwork.calculateStress} walks every member with a {@code getBlockEntity}
+	 * apiece. The cost of one flip is therefore O(the player's factory), not O(this engine).
+	 *
+	 * <p>Measured, on a vessel taking in air more slowly than the engine spends it: 30 mode changes
+	 * in 100 ticks, one every third tick, each one of those teardowns. {@link CAESConfig#chargeMarginStress()}
+	 * is the deadband between compressing and generating; this is the deadband between generating
+	 * and giving up. The mod needs both, and for the same reason.
+	 *
+	 * <p>This is the guard that bounds the churn, and {@code aTrickleFedEngineDoesNotFlapItsMode}
+	 * fails without it. The whole-stroke affordability test in {@link #decideMode} is its cheaper
+	 * companion: it keeps the engine from taking a mode it would leave again on the same tick, which
+	 * next to a merely empty vessel is two {@code updateGeneratedRotation} calls — an attach and a
+	 * detach of the rotation network — once per cooldown, for ever.
+	 *
+	 * <p>That companion's whole effect is a mode change that begins and ends inside one tick, so
+	 * neither a per-tick sample of the mode nor {@link IdleReason} can see it — the cooldown that
+	 * {@link #generate}'s bail-out arms reports NO_AIR on the following tick exactly as the gate
+	 * would have. {@link #getModeChanges()} is what makes it visible, and
+	 * {@code anEmptyVesselNeverStartsGenerating} and {@code anEngineWillNotStartAStrokeItCannotPayFor}
+	 * both require it to be zero. Lowering the threshold to a single millibucket fails the second;
+	 * deleting the gate fails both.
+	 */
+	private static final int NO_AIR_COOLDOWN_TICKS = 20;
+
 	private EngineMode mode = EngineMode.IDLE;
 	private IdleReason idleReason = IdleReason.NONE;
 	private int warmup = WARMUP_TICKS;
@@ -101,6 +134,25 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 	private float airBuffer;
 	/** Air moved on the last tick, in mB. Display only, synced for the goggle overlay. */
 	private float airRate;
+	/** Ticks left before a discharge that ran dry may start again. See {@link #NO_AIR_COOLDOWN_TICKS}. */
+	private int airCooldown;
+
+	/**
+	 * How many times this engine has changed mode.
+	 *
+	 * <p>Diagnostic, and what the GameTests budget in place of wall-clock. A mode change is the
+	 * expensive event here — see {@link #NO_AIR_COOLDOWN_TICKS} for what one costs — and counting them
+	 * is machine-independent in a way that timing them is not. It also sees what sampling
+	 * {@link #getMode()} once a tick cannot: a mode taken and given back inside the same tick, which
+	 * is exactly the shape the entry gate in {@link #decideMode} exists to prevent.
+	 *
+	 * <p>Not persisted and not synced: it is a rate, not state.
+	 */
+	private long modeChanges;
+
+	public long getModeChanges() {
+		return modeChanges;
+	}
 
 	@Nullable
 	private BlockCapabilityCache<IFluidHandler, Direction> airCache;
@@ -117,6 +169,16 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 
 	public EngineMode getMode() {
 		return mode;
+	}
+
+	/**
+	 * Why this engine is idle, if it is. Diagnostic — nothing branches on it — but it is what the
+	 * goggles show, and it is also the only outward sign of which gate in {@link #decideMode}
+	 * stopped a discharge: an engine that never entered GENERATING reports NO_AIR, whereas one that
+	 * entered and bailed out of {@link #generate} still reports NONE.
+	 */
+	public IdleReason getIdleReason() {
+		return idleReason;
 	}
 
 	// --- kinetics ---------------------------------------------------------------------------
@@ -287,6 +349,9 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 			return;
 		}
 
+		if (airCooldown > 0)
+			airCooldown--;
+
 		alignDirectionWith(getTheoreticalSpeed());
 		rememberNetworkSpeed();
 
@@ -325,11 +390,17 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 
 		boolean wantsToGenerate = headroom < 0 || soleSource;
 		if (wantsToGenerate) {
-			if (hasAir(air)) {
-				idleReason = IdleReason.NONE;
-				return EngineMode.GENERATING;
-			}
-			return idle(IdleReason.NO_AIR);
+			// Two gates, and both are hysteresis rather than gameplay. The cooldown keeps a supply
+			// that cannot keep up from flipping the mode every few ticks, and the affordability test
+			// asks for a whole stroke rather than the single millibucket this used to accept -- an
+			// engine that cannot pay for one tick has no business starting one. Continuing a
+			// discharge asks for neither: it runs until generate() finds it cannot pay, which is
+			// what makes this a band and not just a higher threshold.
+			if (mode != EngineMode.GENERATING
+				&& (airCooldown > 0 || !canDraw(air, strokeCost())))
+				return idle(IdleReason.NO_AIR);
+			idleReason = IdleReason.NONE;
+			return EngineMode.GENERATING;
 		}
 
 		float speed = Math.abs(getTheoreticalSpeed());
@@ -370,6 +441,7 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 	}
 
 	private void setMode(EngineMode next) {
+		modeChanges++;
 		mode = next;
 		// Only on a real change: a compressor's leftovers must not be spent as a motor's first drink.
 		airBuffer = 0;
@@ -416,12 +488,7 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 	private void generate(@Nullable IFluidHandler air) {
 		if (air == null)
 			return;
-		float rated = getRatedStress();
-		float deficit = networkStressWithoutSelf() - networkCapacityWithoutSelf();
-		// Only pay for the stress actually being asked of it, but never nothing: a shaft spinning
-		// on stored air has to cost something or the vessel would be a perpetual motion machine.
-		float supplied = Mth.clamp(deficit, rated * CAESConfig.idleAirDraw(), rated);
-		float mb = supplied * CAESConfig.airPerStressUnit();
+		float mb = generationDraw();
 		setAirRate(-mb);
 
 		airBuffer += mb;
@@ -429,10 +496,39 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 		if (whole <= 0)
 			return;
 
-		FluidStack drained = air.drain(new FluidStack(CAESFluids.COMPRESSED_AIR.get(), whole), FluidAction.EXECUTE);
-		airBuffer -= drained.getAmount();
-		if (drained.getAmount() < whole)
+		// Ask before taking. Draining short would mean the engine turned for air it never got, and
+		// setMode clears the buffer on the way out, so the shortfall was forgiven rather than
+		// carried -- measured, an engine on a 1mB/tick trickle running mostly on air nothing paid
+		// for. A stroke it cannot afford is not started, and the dregs stay in the vessel until
+		// there is enough for a whole one. One stack, both calls: drain does not modify its
+		// argument.
+		FluidStack stroke = new FluidStack(CAESFluids.COMPRESSED_AIR.get(), whole);
+		if (air.drain(stroke, FluidAction.SIMULATE)
+			.getAmount() < whole) {
+			airCooldown = NO_AIR_COOLDOWN_TICKS;
 			setMode(EngineMode.IDLE);
+			return;
+		}
+		airBuffer -= air.drain(stroke, FluidAction.EXECUTE)
+			.getAmount();
+	}
+
+	/**
+	 * Air this engine spends on one tick of generating, in mB.
+	 *
+	 * <p>Only what the network is actually asking of it, but never nothing: a shaft spinning on
+	 * stored air has to cost something or the vessel would be a perpetual motion machine.
+	 */
+	private float generationDraw() {
+		float rated = getRatedStress();
+		float deficit = networkStressWithoutSelf() - networkCapacityWithoutSelf();
+		float supplied = Mth.clamp(deficit, rated * CAESConfig.idleAirDraw(), rated);
+		return supplied * CAESConfig.airPerStressUnit();
+	}
+
+	/** One whole stroke's worth of air, rounded up — what starting a discharge has to afford. */
+	private int strokeCost() {
+		return Math.max(1, (int) Math.ceil(generationDraw()));
 	}
 
 	private void setAirRate(float rate) {
@@ -479,9 +575,11 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 		return airCache.getCapability();
 	}
 
-	private static boolean hasAir(IFluidHandler handler) {
-		return !handler.drain(new FluidStack(CAESFluids.COMPRESSED_AIR.get(), 1), FluidAction.SIMULATE)
-			.isEmpty();
+	/** Whether the supply could hand over {@code amount} mB right now, in full. */
+	private static boolean canDraw(IFluidHandler handler, int amount) {
+		return handler
+			.drain(new FluidStack(CAESFluids.COMPRESSED_AIR.get(), amount), FluidAction.SIMULATE)
+			.getAmount() >= amount;
 	}
 
 	private static boolean hasRoom(IFluidHandler handler) {
@@ -498,8 +596,10 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 		compound.putFloat("RememberedSpeed", rememberedSpeed);
 		compound.putFloat("Efficiency", efficiency);
 		compound.putFloat("AirRate", airRate);
-		if (!clientPacket)
+		if (!clientPacket) {
 			compound.putFloat("AirBuffer", airBuffer);
+			compound.putInt("AirCooldown", airCooldown);
+		}
 		super.write(compound, registries, clientPacket);
 	}
 
@@ -512,8 +612,10 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 		rememberedSpeed = compound.getFloat("RememberedSpeed");
 		efficiency = compound.getFloat("Efficiency");
 		airRate = compound.getFloat("AirRate");
-		if (!clientPacket)
+		if (!clientPacket) {
 			airBuffer = compound.getFloat("AirBuffer");
+			airCooldown = compound.getInt("AirCooldown");
+		}
 	}
 
 	@Override

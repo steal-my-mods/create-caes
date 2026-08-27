@@ -21,7 +21,13 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.level.block.state.BlockState;
 
 /**
- * Draws the flywheel and the piston rod. The block model itself is static; only these two move.
+ * Draws the flywheel and the piston rod on the CPU. The block model itself is static; only these two
+ * move.
+ *
+ * <p>This is the <em>fallback</em> path. {@link AirEngineVisual} draws the same two partials through
+ * Flywheel's instancing whenever the backend is on, which is the default, and the two are
+ * line-for-line mirrors of each other on purpose — a player must not be able to tell which one drew
+ * their engine. <strong>Change the geometry here and change it there.</strong>
  *
  * <p>The orientation transform is Create's — centre the model, swing it to the block's facing, then
  * do the animation in the model's own frame. Both partials are authored pointing up, so a single

@@ -12,6 +12,7 @@ import com.createcaes.CreateCAES;
 import com.createcaes.engine.AirEngineBlock;
 import com.createcaes.engine.AirEngineBlockEntity;
 import com.createcaes.engine.EngineMode;
+import com.createcaes.engine.IdleReason;
 import com.createcaes.registry.CAESBlocks;
 import com.createcaes.registry.CAESItems;
 import com.createcaes.registry.CAESFluids;
@@ -44,6 +45,7 @@ import net.minecraft.world.item.context.UseOnContext;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.ComparatorBlockEntity;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.neoforged.neoforge.fluids.FluidStack;
 import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
@@ -68,6 +70,31 @@ public class CAESGameTests {
 
 	/** Past the engine's warm-up, with room for the rotation propagator to settle. */
 	private static final int SETTLE_TICKS = 12;
+
+	/** How long {@code aTrickleFedEngineDoesNotFlapItsMode} watches, and how many changes it allows. */
+	private static final int FLAP_SAMPLE_TICKS = 100;
+	/**
+	 * Budget for that window. The guarded engine settles into roughly a 28-tick cycle — a short
+	 * discharge, then {@code NO_AIR_COOLDOWN_TICKS} of waiting — so about seven changes. The
+	 * unguarded one managed 30, so this catches the regression with room to spare either way.
+	 */
+	private static final int FLAP_BUDGET = 14;
+
+	/** A comparator's own two-tick delay, plus a tick for the neighbour update to reach it. */
+	private static final int COMPARATOR_DELAY = 4;
+
+	/** How long aRunningVesselBarelyEverSweepsItsParts watches, and how many sweeps it allows. */
+	private static final int SWEEP_SAMPLE_TICKS = 100;
+	private static final int SWEEP_BUDGET = 2;
+
+	/** Long enough for a tier-1 engine to work through 100mB at a few mB a tick. */
+	private static final int DRAIN_SAMPLE_TICKS = 80;
+	/**
+	 * Smallest whole stroke a tier-1 engine on a one-block vessel ever takes. Its draw is about
+	 * 3.64mB a tick and the buffer carries the fraction, so the integer part is always 3 or 4 —
+	 * anything smaller than this came out of a partial drain.
+	 */
+	private static final int MIN_STROKE = 3;
 
 	// --- compressing ---------------------------------------------------------------------------
 
@@ -861,6 +888,348 @@ public class CAESGameTests {
 			"the scene should contain exactly one vessel controller, found " + controllers);
 		helper.assertTrue(parts == 7, "expected 7 vessel parts around it, found " + parts);
 		helper.succeed();
+	}
+
+	// --- staying cheap -------------------------------------------------------------------------
+
+	/**
+	 * A vessel taking in air more slowly than the engine spends it must settle, not stutter.
+	 *
+	 * <p>This is a performance lock, and the thing it is guarding is expensive out of all proportion
+	 * to this mod. Every drop out of GENERATING takes the engine's generated speed to zero, and with
+	 * nothing else on the shaft that sends Create's {@code propagateMissingSource} over the entire
+	 * kinetic network — every member, with a {@code sendData} each — and the next attempt builds it
+	 * all back. Before {@code NO_AIR_COOLDOWN_TICKS} and the whole-stroke affordability test, this
+	 * rig changed mode 30 times in 100 ticks: one full network teardown every third tick, on a
+	 * network as large as whatever the player built.
+	 *
+	 * <p>What this budget locks is the cooldown and the simulate-before-drain in {@code generate};
+	 * removing either puts the count straight back over. It does not pin the entry threshold, because
+	 * with the cooldown in place that threshold does not change how often the mode moves on this rig —
+	 * anEngineWillNotStartAStrokeItCannotPayFor covers that instead, on a rig where it does.
+	 *
+	 * <p>Both halves are asserted: the sampled count, and the engine's own, which also sees a mode
+	 * taken and given back within one tick.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 300)
+	public static void aTrickleFedEngineDoesNotFlapItsMode(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.ENCASED_FAN.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.WEST));
+
+		int[] changes = { 0 };
+		EngineMode[] previous = { null };
+		long[] countedAtStart = { 0 };
+
+		// Every callback is scheduled from the test body, flat, and that matters: GameTestInfo runs
+		// the body before it takes its iterator over the schedule, but a callback that schedules
+		// more runs *inside* that iteration, and enough new entries rehash the map underneath it.
+		// Nesting these hundred crashed the test server in three runs out of ten.
+		helper.runAfterDelay(SETTLE_TICKS, () -> countedAtStart[0] = engine(helper).getModeChanges());
+
+		for (int i = 1; i <= FLAP_SAMPLE_TICKS; i++)
+			helper.runAfterDelay(SETTLE_TICKS + i, () -> {
+				// A millibucket a tick, against an engine that wants a few: the shape that used to
+				// flip the mode every third tick.
+				fill(helper, 1);
+				EngineMode now = engine(helper).getMode();
+				if (previous[0] != null && previous[0] != now)
+					changes[0]++;
+				previous[0] = now;
+			});
+
+		helper.runAfterDelay(SETTLE_TICKS + FLAP_SAMPLE_TICKS + 1, () -> {
+			helper.assertTrue(changes[0] <= FLAP_BUDGET,
+				"a trickle-fed engine should settle rather than flap: " + changes[0]
+					+ " mode changes in " + FLAP_SAMPLE_TICKS + " ticks, budget " + FLAP_BUDGET);
+			// And the engine's own count, which unlike the sample above also sees a mode taken and
+			// given back inside one tick.
+			long counted = engine(helper).getModeChanges() - countedAtStart[0];
+			helper.assertTrue(counted <= FLAP_BUDGET,
+				"the engine counted " + counted + " mode changes in " + FLAP_SAMPLE_TICKS
+					+ " ticks, budget " + FLAP_BUDGET);
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * A running vessel sweeps its parts almost never, and this is the budget that says so.
+	 *
+	 * <p>The only performance assertion worth having in CI is a count of work done, not a stopwatch:
+	 * a count is a property of the code and comes out the same on every machine, where a microsecond
+	 * budget is a property of whatever ran the build. So this counts sweeps.
+	 *
+	 * <p>An engine moves air on every tick it runs, so {@code onFluidStackChanged} fires 100 times in
+	 * this window and the unguarded code swept on every one of them — 100 sweeps, 4,500 block entity
+	 * lookups and 4,500 neighbour updates, all to publish a redstone level that had not changed.
+	 * A hundred ticks of compression moves about 3% of a 45-block vessel, so the reading can move at
+	 * most once. The budget is two, which leaves a 50x margin over the regression and no room for the
+	 * guard to be quietly removed.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 400)
+	public static void aRunningVesselBarelyEverSweepsItsParts(GameTestHelper helper) {
+		floor(helper);
+		for (int y = 1; y <= 5; y++)
+			for (int x = 4; x <= 6; x++)
+				for (int z = 4; z <= 6; z++)
+					helper.setBlock(new BlockPos(x, y, z), vessel());
+		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
+		helper.setBlock(DRIVER, AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+
+		long[] sweptAtStart = { 0 };
+		int[] ticksCompressing = { 0 };
+
+		helper.runAfterDelay(SETTLE_TICKS + 20,
+			() -> sweptAtStart[0] = vessel(helper).getComparatorSweeps());
+
+		// Counting the compressing ticks as well, so a version that swept rarely because it was not
+		// running cannot pass by accident.
+		for (int i = 1; i <= SWEEP_SAMPLE_TICKS; i++)
+			helper.runAfterDelay(SETTLE_TICKS + 20 + i, () -> {
+				if (engine(helper).getMode() == EngineMode.COMPRESSING)
+					ticksCompressing[0]++;
+			});
+
+		helper.runAfterDelay(SETTLE_TICKS + 21 + SWEEP_SAMPLE_TICKS, () -> {
+			helper.assertTrue(ticksCompressing[0] >= SWEEP_SAMPLE_TICKS - 2,
+				"the engine should have been compressing throughout, was for only "
+					+ ticksCompressing[0] + " of " + SWEEP_SAMPLE_TICKS + " ticks");
+			long swept = vessel(helper).getComparatorSweeps() - sweptAtStart[0];
+			helper.assertTrue(swept <= SWEEP_BUDGET,
+				"a compressing vessel swept its parts " + swept + " times in " + SWEEP_SAMPLE_TICKS
+					+ " ticks, budget " + SWEEP_BUDGET + " (unguarded this is one per tick)");
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * The comparator still hears about it — and specifically, so do the parts that are not the
+	 * controller.
+	 *
+	 * <p>The sweep runs only when the reading moves, because unguarded it runs twenty times a second
+	 * to publish a number that changed zero times in 100 ticks. This is the other half of that
+	 * guard: suppressing the sweep for a level that has not moved must not suppress it for one that
+	 * has.
+	 *
+	 * <p>Two things about this rig are load-bearing, and an earlier version of it had both wrong and
+	 * passed with the sweep deleted outright.
+	 *
+	 * <p>The comparator sits beside the <em>upper</em> block, which is not the controller.
+	 * {@code BlockEntity.setChanged} already calls {@code updateNeighbourForOutputSignal} for its own
+	 * position, so the controller's neighbours are told every tick whatever this guard does — a
+	 * comparator next to the controller therefore tests nothing. Telling the rest of the multiblock
+	 * is the sweep's entire job.
+	 *
+	 * <p>And the assertion is on the level stored in the comparator's block entity, not on POWERED.
+	 * POWERED is not a probe: {@code DiodeBlock.tick} powers an unpowered diode on any scheduled tick
+	 * and only then schedules another to turn it back off, so it flickers true for reasons that have
+	 * nothing to do with the vessel. {@code ComparatorBlockEntity.output} only moves when the
+	 * comparator is genuinely re-evaluated.
+	 *
+	 * <p>Two smaller traps: the comparator has to sit at the same height as the block that notifies
+	 * it, because {@code ComparatorBlock.onNeighborChange} ignores a neighbour at a different Y; and
+	 * a diode's FACING points at what it reads, not at what it powers.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void aVesselKeepsTellingItsComparators(GameTestHelper helper) {
+		rig(helper);
+		BlockPos upper = VESSEL.above();
+		helper.setBlock(upper, vessel());
+		// Beside the upper course, facing north at it. A diode needs something solid underneath, and
+		// andesite is a redstone conductor, so a notification from the lower course stops there
+		// rather than reaching the comparator: only the sweep can tell this one.
+		BlockPos comparator = upper.offset(0, 0, 1);
+		helper.setBlock(comparator.below(), Blocks.POLISHED_ANDESITE);
+		helper.setBlock(comparator, Blocks.COMPARATOR.defaultBlockState()
+			.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.NORTH));
+
+		// Scheduled flat rather than nested, for the reason given in
+		// aTrickleFedEngineDoesNotFlapItsMode. Two courses hold 16,000mB, so a quarter full is
+		// 4,000 and reads 4 on Create's floor(frac * 14 + 1) curve.
+		helper.runAfterDelay(SETTLE_TICKS, () -> {
+			helper.assertTrue(vessel(helper).getBlockPos()
+				.equals(helper.absolutePos(VESSEL)),
+				"this test needs the lower course to be the controller, so that the comparator is "
+					+ "beside a part that only the sweep will tell");
+			assertComparator(helper, comparator, 0, "an empty vessel");
+			fill(helper, 4000);
+		});
+
+		helper.runAfterDelay(SETTLE_TICKS + COMPARATOR_DELAY, () -> {
+			assertComparator(helper, comparator, 4, "a quarter-full vessel");
+			fill(helper, 12000);
+		});
+
+		helper.runAfterDelay(SETTLE_TICKS + 2 * COMPARATOR_DELAY, () -> {
+			assertComparator(helper, comparator, 15, "a full vessel");
+			vessel(helper).getTankInventory()
+				.drain(Integer.MAX_VALUE, FluidAction.EXECUTE);
+		});
+
+		helper.runAfterDelay(SETTLE_TICKS + 3 * COMPARATOR_DELAY, () -> {
+			assertComparator(helper, comparator, 0, "an emptied vessel");
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * Every drain is a whole stroke or nothing.
+	 *
+	 * <p>{@code generate} asks the supply what it can give before taking any of it. Draining short
+	 * instead would mean the engine turned for air it never received, and {@code setMode} clears the
+	 * air buffer on the way out, so the shortfall was forgiven rather than carried — measured, on a
+	 * trickle, as an engine running mostly on air nothing paid for. The flap budget does not catch
+	 * that on its own: restoring the partial drain while still arming the cooldown keeps the mode
+	 * changes inside budget and only the air goes missing. So this watches the tank instead, and a
+	 * tier-1 engine's stroke is only ever 3 or 4mB, which makes a partial one obvious.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 300)
+	public static void anEngineNeverDrainsAPartialStroke(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		// Not a whole number of strokes, so the run has to end on one it cannot afford.
+		fill(helper, 100);
+
+		int[] previous = { -1 };
+		int[] smallestDrop = { Integer.MAX_VALUE };
+		for (int i = 1; i <= DRAIN_SAMPLE_TICKS; i++)
+			helper.runAfterDelay(SETTLE_TICKS + i, () -> {
+				int now = air(helper);
+				if (previous[0] > now)
+					smallestDrop[0] = Math.min(smallestDrop[0], previous[0] - now);
+				previous[0] = now;
+			});
+
+		helper.runAfterDelay(SETTLE_TICKS + DRAIN_SAMPLE_TICKS + 1, () -> {
+			helper.assertTrue(smallestDrop[0] != Integer.MAX_VALUE,
+				"the engine should have spent some air over " + DRAIN_SAMPLE_TICKS + " ticks");
+			helper.assertTrue(smallestDrop[0] >= MIN_STROKE,
+				"every drain should be a whole stroke; the smallest was " + smallestDrop[0] + "mB");
+			helper.assertTrue(air(helper) > 0,
+				"the last stroke it could not afford should have been left in the vessel");
+			helper.succeed();
+		});
+	}
+
+	private static void assertComparator(GameTestHelper helper, BlockPos pos, int expected,
+		String what) {
+		ComparatorBlockEntity be = helper.getBlockEntity(pos);
+		helper.assertTrue(be.getOutputSignal() == expected,
+			what + " should read " + expected + " on the comparator, read " + be.getOutputSignal());
+	}
+
+	/**
+	 * An engine with no usable air never enters GENERATING, not even for a tick.
+	 *
+	 * <p>What this locks is that the engine stays put and says why — the existing
+	 * anEmptyVesselDrivesNothing checks one instant, this watches every tick and also checks the
+	 * reason the goggles would show.
+	 *
+	 * <p>Removing the entry gate in {@code decideMode} makes the engine take GENERATING and drop it
+	 * again inside the same tick, which neither the per-tick sample below nor IdleReason can see —
+	 * the cooldown the bail-out arms reports NO_AIR on the next tick just as the gate would have.
+	 * That is what {@code getModeChanges()} is for, and why this asserts on it as well.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 300)
+	public static void anEmptyVesselNeverStartsGenerating(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+
+		int[] blips = { 0 };
+		for (int i = 1; i <= FLAP_SAMPLE_TICKS; i++)
+			helper.runAfterDelay(SETTLE_TICKS + i, () -> {
+				if (engine(helper).getMode() != EngineMode.IDLE)
+					blips[0]++;
+			});
+
+		helper.runAfterDelay(SETTLE_TICKS + FLAP_SAMPLE_TICKS + 1, () -> {
+			helper.assertTrue(blips[0] == 0,
+				"an empty vessel should never start a stroke; the engine left IDLE on " + blips[0]
+					+ " of " + FLAP_SAMPLE_TICKS + " ticks");
+			// Not one mode change, ever -- not even one it took and gave back inside a tick, which
+			// is what the entry gate in decideMode is for and what the sample above cannot see.
+			helper.assertTrue(engine(helper).getModeChanges() == 0,
+				"an empty vessel should cost no mode changes at all, counted "
+					+ engine(helper).getModeChanges());
+			// And it should say why, since that is what a player sees on the goggles.
+			helper.assertTrue(engine(helper).getIdleReason() == IdleReason.NO_AIR,
+				"it should be idle for want of air, reported " + engine(helper).getIdleReason());
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * A vessel holding less than one stroke keeps it.
+	 *
+	 * <p>{@code generate} asks the supply what it can give before taking any of it. Draining short
+	 * instead would mean the engine turned for air it never received, and {@code setMode} clears the
+	 * air buffer on the way out, so the shortfall was forgiven rather than carried — measured, on a
+	 * trickle, as an engine running mostly on air nothing paid for. The dregs staying put is the
+	 * visible half of that.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void anEngineWillNotStartAStrokeItCannotPayFor(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		// Less than one stroke: a tier-1 engine on a one-block vessel wants about 4mB a tick.
+		fill(helper, 2);
+
+		helper.runAfterDelay(SETTLE_TICKS + 40, () -> {
+			helper.assertTrue(air(helper) == 2,
+				"a vessel holding less than one stroke should keep it, holds " + air(helper) + "mB");
+			helper.assertTrue(engine(helper).getMode() == EngineMode.IDLE,
+				"and the engine should be idle, was " + engine(helper).getMode());
+			// Nor should it have taken the mode and given it straight back: this is what pins the
+			// entry gate to a whole stroke rather than to any air at all.
+			helper.assertTrue(engine(helper).getModeChanges() == 0,
+				"it should never have entered a mode, counted " + engine(helper).getModeChanges());
+			// And it should say why, since that is what a player sees on the goggles.
+			helper.assertTrue(engine(helper).getIdleReason() == IdleReason.NO_AIR,
+				"it should be idle for want of air, reported " + engine(helper).getIdleReason());
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * Engines are counted on every outward face, caps included.
+	 *
+	 * <p>The scan walks the six outward face slabs rather than all six faces of every shell block,
+	 * which is six loops with their own bounds instead of one with a {@code contains} filter. An
+	 * off-by-one in any of them loses engines silently — the vessel would simply report a better
+	 * efficiency than it is entitled to — and the west-wall engine the other tests use would not
+	 * notice. So this one hangs an engine off a cap and off two different walls at once.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 250)
+	public static void enginesAreCountedOnEveryFace(GameTestHelper helper) {
+		floor(helper);
+		// A 3x3x2 vessel: 18 blocks, two engines' worth at the default nine blocks each.
+		for (int x = 4; x <= 6; x++)
+			for (int y = 1; y <= 2; y++)
+				for (int z = 4; z <= 6; z++)
+					helper.setBlock(new BlockPos(x, y, z), vessel());
+
+		helper.setBlock(new BlockPos(5, 3, 5), engineFacing(Direction.DOWN));
+		helper.setBlock(new BlockPos(7, 1, 5), engineFacing(Direction.WEST));
+		helper.setBlock(new BlockPos(5, 1, 3), engineFacing(Direction.SOUTH));
+		// A decoy: touching the vessel, but pointing away from it. Being next to a vessel is not
+		// what attaches an engine to it, and counting this one would derate the other three.
+		helper.setBlock(new BlockPos(5, 1, 7), engineFacing(Direction.SOUTH));
+
+		helper.runAfterDelay(SETTLE_TICKS + 12, () -> {
+			PressureVesselBlockEntity tank = vessel(helper);
+			helper.assertTrue(tank.getTotalVesselSize() == 18,
+				"expected an 18-block vessel, got " + tank.getTotalVesselSize());
+			// Two engines' worth shared three ways. Miss one of the three and this reads 1.0; count
+			// the decoy and it reads 0.5.
+			float efficiency = tank.getEngineEfficiency();
+			helper.assertTrue(Math.abs(efficiency - 2F / 3F) < 0.01F,
+				"three engines on eighteen blocks should each get two thirds, got " + efficiency);
+			helper.succeed();
+		});
 	}
 
 	// --- rig -----------------------------------------------------------------------------------

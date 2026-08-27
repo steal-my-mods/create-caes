@@ -107,7 +107,8 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
 | `engine/EngineMode` | IDLE / COMPRESSING / GENERATING, persisted by ordinal and synced |
 | `vessel/PressureVesselBlockEntity` | A slim `IMultiBlockEntityContainer.Fluid`; Create's `ConnectivityHandler` does the multiblock |
 | `registry/CAESFluids` | Compressed Air: a real fluid with no block and no bucket |
-| `client/AirEngineRenderer` | Flywheel and piston rod; the block model itself is static |
+| `client/AirEngineVisual` | The instanced flywheel and piston rod. This is what normally draws them |
+| `client/AirEngineRenderer` | The same two partials on the CPU path, for backends without instancing |
 | `client/PressureVesselCTBehaviour` | Connected textures, so a 3x3 tower is one tank and not nine crates |
 | `client/CAESTooltips` | Registers into Create's own tooltip registry, so items get the native Hold-Shift treatment |
 | `client/ponder/AirEngineScenes` | The Ponder scene. Its structure is generated, not authored in-game |
@@ -167,6 +168,73 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   `applyNewSpeed` destroys a generator whose sign opposes a stronger network; it is perfectly happy
   with one that is merely slower. `alignDirectionWith` flips to agree with a shaft that is already
   turning, which is exactly what `SteamEngineBlockEntity` does with its rotation setting.
+- **The vessel only tells its neighbours when the comparator reading has actually moved, and that
+  guard is the difference between free and being the most expensive thing here.** `SmartFluidTank`
+  fires its callback on every fill and drain, and an engine moves air on *every* tick it runs — even
+  the smallest legal setup shifts ~25mB — so `onFluidStackChanged` runs 20 times a second. Its sweep
+  is a `getBlockEntity` plus an `updateNeighbourForOutputSignal` for every block of the multiblock,
+  and the latter is itself four neighbour blockstate reads. Measured over 100 ticks of steady
+  compression on a 3x3x5 vessel: 4,500 lookups, 4,500 neighbour updates, and the redstone level
+  changed **zero** times — about 40us a tick, or ~260us at the 3x3x32 cap, to publish a number that
+  did not move. Create's Fluid Tank runs the identical loop unguarded and is right to; a tank's
+  contents change when a pipe moves fluid, not on a timer. Two things to know before touching it:
+  `BlockEntity.setChanged` already calls `updateNeighbourForOutputSignal` for its *own* position, so
+  the controller's neighbours are told regardless and telling the **rest** of the multiblock is the
+  sweep's only job — which is why `aVesselKeepsTellingItsComparators` puts its comparator beside a
+  non-controller course, and why the same test beside the controller passed with the sweep deleted.
+  And a comparator's `POWERED` is not a probe for this: `DiodeBlock.tick` powers an unpowered diode on
+  any scheduled tick and only then schedules another to turn it off again, so it flickers true for
+  unrelated reasons. Assert on `ComparatorBlockEntity.output`.
+- **Dropping out of GENERATING is expensive, so there is a deadband on the way out as well as in.**
+  It takes `getGeneratedSpeed()` to zero, and with nothing else driving the shaft that is
+  `applyNewSpeed`'s costly branch: `detachKinetics` sends `RotationPropagator.propagateMissingSource`
+  over the whole network with a `sendData` per member, and the next attempt runs `attachKinetics` to
+  rebuild it, while `refreshKineticContribution` walks every member again through
+  `KineticNetwork.calculateStress`. One flip costs O(the player's factory). A vessel taking in air
+  more slowly than the engine spent it flipped **30 times in 100 ticks** — measured — so
+  `NO_AIR_COOLDOWN_TICKS` now holds it off for a second. `chargeMarginStress` is the deadband between
+  compressing and generating; this is the one between generating and giving up, and the mod needs
+  both. `aTrickleFedEngineDoesNotFlapItsMode` is the lock and fails without it.
+- **`generate` asks the supply before it takes anything, and that is a balance rule, not a style
+  choice.** Draining short means the engine turned for air it never got, and `setMode` clears
+  `airBuffer` on the way out, so the shortfall was *forgiven* rather than carried — on a trickle,
+  measured, an engine running mostly on air nothing paid for. So a stroke it cannot afford is not
+  started, and the dregs stay in the vessel until there are enough for a whole one. A vessel
+  therefore bottoms out a few mB above empty, which is correct rather than a rounding bug.
+  `anEngineNeverDrainsAPartialStroke` is the lock; note the flap budget alone does **not** catch this,
+  because restoring the partial drain while still arming the cooldown keeps the mode changes in
+  budget and only the air goes missing.
+- **The engine scan walks the six outward face slabs, not every face of every shell block.**
+  `2w² + 4wh` positions, all of which genuinely touch the outside, instead of `6 ×` the shell with
+  two thirds thrown away again by a `contains` test — 402 against 1,548 on a 3x3x32 vessel, ten times
+  a second. Walking slabs also means the inward direction is known from which slab you are on, so the
+  only thing left to check is the engine's facing and `contains` is gone entirely. The probe is a
+  blockstate read, not `getBlockEntity`, which resolves pending block entities and will create one,
+  for a position that is almost never an engine. `enginesAreCountedOnEveryFace` covers the caps, the
+  walls and a decoy engine pointing the wrong way; an off-by-one in any slab silently *raises* a
+  vessel's efficiency, so it would not otherwise announce itself.
+- **A rotating block needs a Flywheel visual as well as a renderer, and the two must agree.** Create
+  registers both for everything that turns — `STEAM_ENGINE` has `SteamEngineVisual` next to
+  `SteamEngineRenderer`, and so do `POWERED_SHAFT` and `FLYWHEEL`. 0.1.1 shipped only the renderer, so
+  every engine in view had both partials transformed vertex by vertex on the CPU every frame instead
+  of being uploaded once and instanced. `AirEngineVisual` is a line-for-line mirror of
+  `AirEngineRenderer`'s geometry on purpose: `skipVanillaRender` defaults to true, so the visual draws
+  the engine with the backend on and the renderer draws it with the backend off, and a player must
+  not be able to tell which. **Change one and change the other.** Registration is by hand
+  (`SimpleBlockEntityVisualizer.builder(...).apply()`) because this mod does not use Registrate's
+  `.visual(...)`, and a visual that fails to register is silent — hence the startup check in
+  `CAESClient.registerVisuals`. Nothing else can catch it: a dedicated server builds no visuals, so
+  no GameTest sees this at all, and the instanced path was checked the only way it can be — by eye in
+  `runClient`, block and item, flywheel and rod. If you touch either path, note that the default
+  backend is instancing, so what you are looking at is `AirEngineVisual`; `/flywheel backend` swaps to
+  the off backend to put `AirEngineRenderer` on screen instead, and both need looking at.
+- **Never schedule a GameTest callback from inside a GameTest callback.**
+  `GameTestInfo.tickInternal` runs the test body *before* it takes its iterator over the schedule, so
+  scheduling from the body is safe — but a callback runs *during* that iteration, and enough new
+  entries rehash the map underneath it. The failure is a `NullPointerException` deep in fastutil, it
+  crashes the whole test server rather than failing one test, and it is intermittent: a hundred
+  nested `runAfterDelay` calls crashed three runs in ten. Several of the older tests nest one or two
+  and get away with it because two puts do not rehash. Schedule flat.
 - **The engine's efficiency is synced, not recomputed on the client.** Half of what feeds it — the
   fluid capability in front — does not exist client-side, and the goggle overlay reads the tier from
   the client's copy. Compute it once per server tick into the field and let NBT carry it.
@@ -267,10 +335,23 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   the width — the hook supports per-footprint caps and an earlier version used them — but having
   three different ceilings was a rule Create does not have, and the point of this addon is to add as
   few of those as possible. `vesselsStopAtTheHeightCap` covers the cap itself.
-- **Three guards are deliberately untested, and each says so at its call site.** The `getSpeed()`
-  overstress check in `compress`, the `getSpeedTier() == 0` bail in `decideMode`, and the 18-engine
-  ceiling. All three are unreachable at the default config or need a rig no GameTest template can
-  hold. Don't delete them for having no test; do read the comment before changing them.
+- **Four guards are deliberately untested, and each says so at its call site.** The `getSpeed()`
+  overstress check in `compress`, the `getSpeedTier() == 0` bail in `decideMode`, the 18-engine
+  ceiling, and the `lastComparatorLevel` invalidation in `refreshComparators`. The first three are
+  unreachable at the default config or need a rig no GameTest template can hold; the last is
+  observable only in a case where the guard would have let the sweep through anyway. Deleting any of
+  them leaves all 32 tests green. Don't delete them for having no test; do read the comment before
+  changing them.
+- **Performance is asserted as counts of work, never as elapsed time.** A count is a property of the
+  code and comes out identical on a laptop and on a CI runner; a microsecond budget is a property of
+  whatever ran the build, and would either flake or be set so loose it caught nothing. So
+  `PressureVesselBlockEntity#getComparatorSweeps` and `AirEngineBlockEntity#getModeChanges` exist as
+  diagnostics, and `aRunningVesselBarelyEverSweepsItsParts`,
+  `aTrickleFedEngineDoesNotFlapItsMode`, `anEmptyVesselNeverStartsGenerating` and
+  `anEngineWillNotStartAStrokeItCannotPayFor` budget them. Both counters also see what nothing else
+  can: a sweep whose reading did not move has no outward sign at all, and a mode taken and given back
+  inside one tick is invisible to a per-tick sample. Add a counter rather than a stopwatch when the
+  next hot path turns up.
 - **The 18-engine ceiling is Create's, not ours.** `min(18, size / 4)` is the boiler's rule and
   `getEngineEfficiency` is `min(18, size / 9)` for the same reason: without it a tall enough vessel
   runs an unbounded number of engines. It only binds past ~162 blocks, which is more than a GameTest

@@ -14,6 +14,9 @@ import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import com.simibubi.create.foundation.block.connected.CTModel;
 
+import dev.engine_room.flywheel.api.visualization.VisualizerRegistry;
+import dev.engine_room.flywheel.lib.visualization.SimpleBlockEntityVisualizer;
+
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.resources.ResourceLocation;
@@ -125,8 +128,32 @@ public class CAESClient {
 		event.registerBlockEntityRenderer(CAESBlockEntities.AIR_ENGINE.get(), AirEngineRenderer::new);
 	}
 
+	/**
+	 * The instanced path for the Air Engine, and the one that normally runs.
+	 *
+	 * <p>Create registers a Flywheel visual next to the renderer for every rotating block it ships;
+	 * it does it through Registrate's {@code .visual(...)}, which this mod does not use, so the
+	 * underlying registry call is made by hand. {@code skipVanillaRender} defaults to true, which is
+	 * what stops both paths drawing the engine at once — with the backend on the visual draws it,
+	 * with the backend off {@link AirEngineRenderer} does.
+	 */
+	private static void registerVisuals() {
+		SimpleBlockEntityVisualizer.builder(CAESBlockEntities.AIR_ENGINE.get())
+			.factory(AirEngineVisual::new)
+			.apply();
+
+		// A visual that did not register is the same silent failure as a missing Ponder key: the
+		// engine simply renders without its flywheel or its rod on every backend but the fallback,
+		// and nothing is logged. Cheap to check, and this is the only check there is -- a dedicated
+		// server builds no visuals at all, so no GameTest can see this.
+		if (VisualizerRegistry.getVisualizer(CAESBlockEntities.AIR_ENGINE.get()) == null)
+			CreateCAES.LOGGER.warn("The Air Engine's Flywheel visual did not register; it will fall "
+				+ "back to the block entity renderer on every backend");
+	}
+
 	private static void clientSetup(FMLClientSetupEvent event) {
 		event.enqueueWork(() -> {
+			registerVisuals();
 			CAESTooltips.register();
 			PonderIndex.addPlugin(new CAESPonderPlugin());
 			NeoForge.EVENT_BUS.addListener(CAESClient::onClientTick);

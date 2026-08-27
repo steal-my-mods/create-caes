@@ -10,6 +10,7 @@ import com.createcaes.engine.AirEngineBlockEntity;
 import com.createcaes.registry.CAESFluids;
 import com.simibubi.create.api.connectivity.ConnectivityHandler;
 import com.simibubi.create.api.equipment.goggles.IHaveGoggleInformation;
+import com.simibubi.create.foundation.blockEntity.ComparatorUtil;
 import com.simibubi.create.foundation.blockEntity.IMultiBlockEntityContainer;
 import com.simibubi.create.foundation.blockEntity.SmartBlockEntity;
 import com.simibubi.create.foundation.blockEntity.behaviour.BlockEntityBehaviour;
@@ -63,6 +64,30 @@ public class PressureVesselBlockEntity extends SmartBlockEntity
 	private int syncCooldown;
 	private boolean queuedSync;
 
+	/**
+	 * The comparator reading this vessel last told its neighbours about, or -1 for "not yet told".
+	 * Not persisted: -1 on load makes the first change sweep, which is what a freshly loaded vessel
+	 * needs anyway.
+	 */
+	private int lastComparatorLevel = -1;
+
+	/**
+	 * How many times this vessel has swept its parts to publish a comparator reading.
+	 *
+	 * <p>Diagnostic, and the only way a test can see whether the guard on that sweep still works: a
+	 * sweep whose reading has not moved has no other outward sign at all, which is precisely why it
+	 * went unnoticed for two releases. Counting the work is also the only form of performance
+	 * assertion worth putting in CI — a count is a property of the code and comes out the same on
+	 * every machine, where a microsecond budget is a property of the machine.
+	 *
+	 * <p>Not persisted and not synced: it is a rate, not state.
+	 */
+	private long comparatorSweeps;
+
+	public long getComparatorSweeps() {
+		return comparatorSweeps;
+	}
+
 	/** Air Engines drawing on this vessel. Controller only; recounted on the lazy tick. */
 	protected int attachedEngines;
 
@@ -93,28 +118,37 @@ public class PressureVesselBlockEntity extends SmartBlockEntity
 
 	/**
 	 * Counts the Air Engines pointing into this vessel, the way a boiler counts the Steam Engines
-	 * around it. Only the outward faces are probed — an interior block of a 3x3 has no face an
-	 * engine could be attached to — so this stays cheap enough to run on the lazy tick.
+	 * around it.
+	 *
+	 * <p>The six outward face slabs are walked directly — {@code 2w² + 4wh} positions, every one of
+	 * which genuinely touches the outside of the multiblock. The earlier version visited all six
+	 * faces of every shell block and threw two thirds of them away again with a {@code contains}
+	 * test: 1,548 tests to reach 402 real positions on a 3x3x32 vessel, ten times a second.
+	 *
+	 * <p>Walking the slabs also means the inward direction is known from which slab we are on, so
+	 * there is nothing left to test but the engine's own facing — no {@code contains} call at all.
+	 * And the probe is a blockstate read rather than {@code getBlockEntity}, which is much the more
+	 * expensive of the two (it resolves pending block entities and will create one) for a position
+	 * that is almost never an engine.
 	 */
 	private void updateAttachedEngines() {
 		int found = 0;
-		for (int yOffset = 0; yOffset < height; yOffset++)
-			for (int xOffset = 0; xOffset < width; xOffset++)
-				for (int zOffset = 0; zOffset < width; zOffset++) {
-					boolean onShell = yOffset == 0 || yOffset == height - 1 || xOffset == 0
-						|| xOffset == width - 1 || zOffset == 0 || zOffset == width - 1;
-					if (!onShell)
-						continue;
-					BlockPos part = worldPosition.offset(xOffset, yOffset, zOffset);
-					for (Direction face : Direction.values()) {
-						BlockPos outside = part.relative(face);
-						if (contains(outside))
-							continue;
-						if (level.getBlockEntity(outside) instanceof AirEngineBlockEntity engine
-							&& contains(outside.relative(AirEngineBlock.getFacing(engine.getBlockState()))))
-							found++;
-					}
-				}
+
+		// The caps, above and below.
+		for (int x = 0; x < width; x++)
+			for (int z = 0; z < width; z++) {
+				found += enginesAt(worldPosition.offset(x, -1, z), Direction.UP);
+				found += enginesAt(worldPosition.offset(x, height, z), Direction.DOWN);
+			}
+
+		// The four walls, course by course.
+		for (int y = 0; y < height; y++)
+			for (int along = 0; along < width; along++) {
+				found += enginesAt(worldPosition.offset(-1, y, along), Direction.EAST);
+				found += enginesAt(worldPosition.offset(width, y, along), Direction.WEST);
+				found += enginesAt(worldPosition.offset(along, y, -1), Direction.SOUTH);
+				found += enginesAt(worldPosition.offset(along, y, width), Direction.NORTH);
+			}
 
 		if (found != attachedEngines) {
 			attachedEngines = found;
@@ -123,11 +157,14 @@ public class PressureVesselBlockEntity extends SmartBlockEntity
 		}
 	}
 
-	private boolean contains(BlockPos pos) {
-		BlockPos min = worldPosition;
-		return pos.getX() >= min.getX() && pos.getX() < min.getX() + width
-			&& pos.getY() >= min.getY() && pos.getY() < min.getY() + height
-			&& pos.getZ() >= min.getZ() && pos.getZ() < min.getZ() + width;
+	/**
+	 * 1 if an Air Engine sits at {@code pos} facing {@code inwards}, which for a position on an
+	 * outward face slab means facing into this vessel. 0 otherwise.
+	 */
+	private int enginesAt(BlockPos pos, Direction inwards) {
+		BlockState state = level.getBlockState(pos);
+		return state.getBlock() instanceof AirEngineBlock
+			&& AirEngineBlock.getFacing(state) == inwards ? 1 : 0;
 	}
 
 	/**
@@ -228,7 +265,7 @@ public class PressureVesselBlockEntity extends SmartBlockEntity
 		controller = null;
 		width = 1;
 		height = 1;
-		onFluidStackChanged(tankInventory.getFluid());
+		refreshComparators();
 
 		BlockState state = getBlockState();
 		if (state.getBlock() instanceof PressureVesselBlock) {
@@ -261,7 +298,7 @@ public class PressureVesselBlockEntity extends SmartBlockEntity
 				getController().getY() + height - 1 == getBlockPos().getY());
 			level.setBlock(getBlockPos(), state, 6);
 		}
-		onFluidStackChanged(tankInventory.getFluid());
+		refreshComparators();
 		setChanged();
 	}
 
@@ -362,6 +399,45 @@ public class PressureVesselBlockEntity extends SmartBlockEntity
 	protected void onFluidStackChanged(FluidStack newFluidStack) {
 		if (!hasLevel())
 			return;
+
+		int signal = ComparatorUtil.fractionToRedstoneLevel(getFillState());
+		if (signal != lastComparatorLevel) {
+			lastComparatorLevel = signal;
+			updateComparators();
+		}
+
+		if (!level.isClientSide) {
+			setChanged();
+			sendData();
+		}
+	}
+
+	/**
+	 * Tells every part's neighbours that the comparator reading moved.
+	 *
+	 * <p>Guarded by {@link #lastComparatorLevel}, and that guard is not an optimisation so much as
+	 * the difference between this being free and this being the most expensive thing the mod does.
+	 * An engine moves air on <em>every</em> tick it runs — even the smallest legal setup shifts about
+	 * 25mB — so {@link SmartFluidTank}'s callback fires twenty times a second, while the only thing
+	 * this sweep publishes is a 0..15 redstone level. Measured over 100 ticks of steady compression
+	 * on a 3x3x5 vessel: 4,500 {@code partAt} lookups, 4,500 neighbour updates, and the level
+	 * changed <em>zero</em> times. Each {@code updateNeighbourForOutputSignal} is itself four
+	 * neighbour blockstate reads, so at the 3x3x32 height cap the unguarded sweep costs roughly
+	 * 260us per tick per vessel to publish a number that did not move.
+	 *
+	 * <p>Create's Fluid Tank runs this same loop unguarded, and is right to: a tank's contents only
+	 * change when a pipe moves fluid. Ours change on every tick of every attached engine, which is
+	 * what turns a benign loop into a hot one.
+	 *
+	 * <p>Worth knowing when reading the guard: {@code BlockEntity.setChanged} already calls
+	 * {@code updateNeighbourForOutputSignal} for its <em>own</em> position, so the controller's
+	 * neighbours hear about it every tick whatever this does. Telling the rest of the multiblock is
+	 * the only thing this sweep is for, which is why {@code aVesselKeepsTellingItsComparators} puts
+	 * its comparator beside a part that is not the controller — beside the controller it would pass
+	 * with this method deleted.
+	 */
+	private void updateComparators() {
+		comparatorSweeps++;
 		for (int yOffset = 0; yOffset < height; yOffset++)
 			for (int xOffset = 0; xOffset < width; xOffset++)
 				for (int zOffset = 0; zOffset < width; zOffset++) {
@@ -370,11 +446,24 @@ public class PressureVesselBlockEntity extends SmartBlockEntity
 					if (partAt != null)
 						level.updateNeighbourForOutputSignal(pos, partAt.getBlockState().getBlock());
 				}
+	}
 
-		if (!level.isClientSide) {
-			setChanged();
-			sendData();
-		}
+	/**
+	 * Forces the next {@link #onFluidStackChanged} to sweep whatever the level reads.
+	 *
+	 * <p>Forming, splitting and resizing all change which blocks are part of the vessel, so their
+	 * neighbours have to be re-told even when the reading itself is unchanged — the guard above is
+	 * about a level that has not moved, not about a shape that has.
+	 *
+	 * <p>The invalidation is <strong>not covered by a test</strong>, and deleting it leaves all 31
+	 * GameTests green. Growing or splitting a vessel changes its capacity, so in practice the
+	 * reading moves too and the guard would have let the sweep through anyway; a case where the shape
+	 * changes and the level does not needs air added in exact proportion to the blocks. It is here
+	 * because relying on that coincidence is not the same as being correct.
+	 */
+	private void refreshComparators() {
+		lastComparatorLevel = -1;
+		onFluidStackChanged(tankInventory.getFluid());
 	}
 
 	void refreshCapability() {
