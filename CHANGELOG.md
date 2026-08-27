@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.2
+
+Performance, on the server tick, plus one balance leak the same code path was causing. An 0.1.1
+world loads unchanged and nothing about how the mod is played changes, except that an engine whose
+air supply cannot keep up now waits instead of stuttering.
+
+- **A vessel no longer sweeps its whole volume every tick.** Telling a vessel's neighbours that its
+  comparator reading moved means a `getBlockEntity` and a neighbour update for every block of the
+  multiblock, and the tank changes on every tick an engine runs -- so this ran twenty times a second
+  to publish a number that, measured over 100 ticks of steady compression, changed exactly zero
+  times. It now runs when the reading actually moves. Measured on a 3x3x5 vessel: 4,500 neighbour
+  updates per 100 ticks became none, and about 40us of every tick came back. At the 3x3x32 height cap
+  it is closer to 260us per tick, per vessel.
+- **An engine whose supply cannot keep up waits instead of stuttering.** Dropping out of generating
+  takes the engine's speed to zero, which tears the rotation network down and builds it back --
+  work that scales with the size of the player's factory, not with this mod. A vessel taking in air
+  more slowly than the engine spent it flipped mode every third tick, thirty times in a hundred.
+  There is now a deadband on the way out, matching the one that already existed between compressing
+  and generating.
+- **An engine no longer gets air nobody paid for.** It used to drain whatever was left when it could
+  not afford a full stroke, and the leftover debt was then forgiven on the way to idle -- on a
+  trickle, an engine ran mostly on air it never bought. It now asks before it takes, and the dregs
+  stay in the vessel until there are enough for a whole stroke.
+- **Counting the engines on a vessel is cheaper.** The scan walks the outward faces directly instead
+  of testing all six faces of every block on the shell and discarding two thirds of them, and it
+  reads a blockstate rather than fetching a block entity. On a 3x3x32 vessel that is 402 blockstate
+  reads in place of 1,548 tests and 402 block entity lookups, ten times a second.
+- **The Air Engine is drawn by Flywheel like every other rotating block.** Create pairs an instanced
+  visual with a block entity renderer for its Steam Engine, its shafts and its flywheels; this mod
+  shipped only the renderer, so every engine in view had both its partials transformed vertex by
+  vertex on the CPU every frame. The renderer stays as the fallback for backends that need it.
+
 ## 0.1.1
 
 Fixes to what the Air Engine looks like and to the Ponder scene that explains it. Nothing about how
