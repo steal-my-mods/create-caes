@@ -35,10 +35,16 @@ as it did.
   attaching a bare shaft to a charged engine started it generating and it emptied its vessel driving
   nothing. A cogwheel did it too, and so did a *disengaged* clutch. The guard that was supposed to
   prevent this asked whether a shaft was attached, which is a much weaker question than whether
-  anything wants power; it now measures the stress the network would actually draw. An engine holding
-  for this reason says "Nothing needs power" rather than reporting the shaft as unpowered. Note a
-  network of nothing but Air Engines asks for nothing, by the same rule that stops one engine
-  compressing off another.
+  anything wants power. An engine holding for this reason says "Nothing needs power" rather than
+  reporting the shaft as unpowered. Note a network of nothing but Air Engines asks for nothing, by the
+  same rule that stops one engine compressing off another.
+- **`c:kinetic_relay` is how it tells a load from a pipe, and packs can extend it.** The tag lists the
+  blocks that do nothing but pass rotation along — shafts, cogwheels, gearboxes, clutches, gearshifts,
+  chain drives, the encased variants, the gauges — and everything not in it counts as worth driving, so
+  a block from a mod this one has never heard of gets driven rather than ignored. Add your own relay
+  with a datapack. Stress is deliberately *not* the test: Create gives belts, Gantry Shafts and
+  flywheels an impact of exactly zero, so an engine keyed on stress would have refused to drive a belt
+  network — the most ordinary load in the game.
 - Goggles distinguish the two shortfalls: an engine that will not compress because the surplus is
   coming from some *other* mod's store says so, rather than reporting the network as short.
 - **A Pressure Vessel can still buffer between two networks, and that is the point of the rule being
