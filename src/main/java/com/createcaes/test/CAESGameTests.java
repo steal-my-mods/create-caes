@@ -14,6 +14,7 @@ import com.createcaes.engine.AirEngineBlockEntity;
 import com.createcaes.engine.EngineMode;
 import com.createcaes.engine.IdleReason;
 import com.createcaes.registry.CAESBlocks;
+import com.createcaes.registry.CAESTags;
 import com.createcaes.registry.CAESItems;
 import com.createcaes.registry.CAESFluids;
 import com.createcaes.vessel.PressureVesselBlock;
@@ -21,10 +22,12 @@ import com.createcaes.vessel.PressureVesselBlockEntity;
 import com.simibubi.create.AllBlocks;
 import com.simibubi.create.content.kinetics.base.KineticBlockEntity;
 import com.simibubi.create.content.kinetics.motor.CreativeMotorBlockEntity;
+import com.simibubi.create.foundation.fluid.SmartFluidTank;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestAssertException;
 import net.minecraft.nbt.CompoundTag;
@@ -33,6 +36,7 @@ import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.tags.TagKey;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.gametest.framework.GameTestHelper;
@@ -95,6 +99,9 @@ public class CAESGameTests {
 	 * anything smaller than this came out of a partial drain.
 	 */
 	private static final int MIN_STROKE = 3;
+
+	/** How long {@code oneNetworkNeverChargesAndDischargesAtOnce} watches every engine on the shaft. */
+	private static final int MODE_SAMPLE_TICKS = 100;
 
 	// --- compressing ---------------------------------------------------------------------------
 
@@ -1232,6 +1239,201 @@ public class CAESGameTests {
 		});
 	}
 
+	// --- one network, one direction ------------------------------------------------------------
+
+	/**
+	 * A kinetic network is either charging or discharging, never both at once.
+	 *
+	 * <p>The rig is the reported failure, reduced to the smallest thing that shows it: three engines
+	 * on one shaft, two bolted to nine-block vessels and one to a single block, with air in the two
+	 * big ones and none in the small one. {@code chargeMarginStress} does not refuse this. It was
+	 * only ever sized to stop <em>one</em> motor covering <em>one</em> compressor of its own tier —
+	 * and here the compressor is a tier below what is driving it, so its draw is a fraction of the
+	 * capacity on offer: 3,641su against 8,192su, which clears the margin with room to spare. Before
+	 * the coalition rule the small engine charged happily off the big one's output, turning stored
+	 * air back into stored air at the round-trip loss, for ever.
+	 *
+	 * <p>Every tick is sampled rather than only the end state, because the interesting failure is not
+	 * a steady leech but a network that spends alternate ticks charging and discharging — which a
+	 * single reading at the end would miss entirely.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 300)
+	public static void oneNetworkNeverChargesAndDischargesAtOnce(GameTestHelper helper) {
+		floor(helper);
+
+		// Two nine-block vessels facing each other down one shaft, each with its own engine. Nine
+		// blocks to one engine is full efficiency, so both of these are tier 4.
+		BlockPos westVessel = new BlockPos(0, 1, 4);
+		BlockPos eastVessel = new BlockPos(8, 1, 4);
+		for (int x = 0; x < 3; x++)
+			for (int z = 0; z < 3; z++) {
+				helper.setBlock(westVessel.offset(x, 0, z), vessel());
+				helper.setBlock(eastVessel.offset(x, 0, z), vessel());
+			}
+
+		BlockPos westEngine = new BlockPos(3, 1, 5);
+		BlockPos eastEngine = new BlockPos(7, 1, 5);
+		helper.setBlock(westEngine, engineFacing(Direction.WEST));
+		helper.setBlock(eastEngine, engineFacing(Direction.EAST));
+		helper.setBlock(new BlockPos(4, 1, 5), cogwheel());
+		helper.setBlock(new BlockPos(5, 1, 5), shaft());
+		helper.setBlock(new BlockPos(6, 1, 5), shaft());
+
+		// The third engine hangs off a cogwheel above the first, because a shaft only ever reaches
+		// the two blocks at its ends -- three engines cannot sit in one straight line. One block of
+		// vessel is a ninth of an engine's worth: tier 1, and a draw well under what either of the
+		// other two supplies.
+		BlockPos smallVessel = new BlockPos(7, 2, 5);
+		BlockPos smallEngine = new BlockPos(6, 2, 5);
+		helper.setBlock(new BlockPos(4, 2, 5), cogwheel());
+		helper.setBlock(new BlockPos(5, 2, 5), shaft());
+		helper.setBlock(smallEngine, engineFacing(Direction.EAST));
+		helper.setBlock(smallVessel, vessel());
+
+		int charge = 40000;
+		tankAt(helper, westVessel).fill(new FluidStack(CAESFluids.COMPRESSED_AIR.get(), charge),
+			FluidAction.EXECUTE);
+		tankAt(helper, eastVessel).fill(new FluidStack(CAESFluids.COMPRESSED_AIR.get(), charge),
+			FluidAction.EXECUTE);
+
+		int[] splitTicks = { 0 };
+		int[] chargingTicks = { 0 };
+
+		// Flat, never nested: a callback that schedules more runs inside GameTestInfo's own
+		// iteration over the schedule, and enough new entries rehash the map underneath it.
+		for (int i = 0; i <= MODE_SAMPLE_TICKS; i++)
+			helper.runAfterDelay(SETTLE_TICKS + i, () -> {
+				boolean generating = false;
+				boolean compressing = false;
+				for (BlockPos pos : List.of(westEngine, eastEngine, smallEngine)) {
+					EngineMode mode = ((AirEngineBlockEntity) helper.getBlockEntity(pos)).getMode();
+					generating |= mode == EngineMode.GENERATING;
+					compressing |= mode == EngineMode.COMPRESSING;
+				}
+				if (generating && compressing)
+					splitTicks[0]++;
+				if (compressing)
+					chargingTicks[0]++;
+			});
+
+		helper.runAfterDelay(SETTLE_TICKS + MODE_SAMPLE_TICKS + 1, () -> {
+			AirEngineBlockEntity small = helper.getBlockEntity(smallEngine);
+
+			helper.assertTrue(splitTicks[0] == 0,
+				"no tick may find one engine generating while another compresses; " + splitTicks[0]
+					+ " of " + MODE_SAMPLE_TICKS + " ticks did");
+			helper.assertTrue(chargingTicks[0] == 0,
+				"nothing on a network running on stored air may charge; something did on "
+					+ chargingTicks[0] + " ticks");
+			helper.assertTrue(tankAt(helper, smallVessel).getFluidAmount() == 0,
+				"the small vessel should have gained nothing, holds "
+					+ tankAt(helper, smallVessel).getFluidAmount() + "mB");
+			// And it should say why, since that is what a player sees on the goggles.
+			helper.assertTrue(small.getIdleReason() == IdleReason.NETWORK_ON_AIR,
+				"the small engine should blame the network, reported " + small.getIdleReason());
+			// The other half of the rule: refusing to charge must not have refused to discharge too.
+			helper.assertTrue(tankAt(helper, westVessel).getFluidAmount() < charge,
+				"and a charged vessel should be paying for the rotation");
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * One vessel, two engines, two separate networks — and it charges from one while discharging
+	 * into the other.
+	 *
+	 * <p>This is the case the coalition rule must <em>not</em> catch, and the reason it is keyed on
+	 * the kinetic network rather than on the vessel. A vessel standing between a network with power
+	 * to spare and a network that is short of it is the mod working as intended; the engines on
+	 * either side of it are strangers to each other and have no business agreeing on a direction.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 250)
+	public static void aVesselBuffersBetweenTwoNetworks(GameTestHelper helper) {
+		floor(helper);
+
+		BlockPos tank = new BlockPos(1, 1, 3);
+		for (int x = 0; x < 3; x++)
+			for (int z = 0; z < 3; z++)
+				helper.setBlock(tank.offset(x, 0, z), vessel());
+
+		// The charging side: a creative motor straight onto an engine facing down into the vessel.
+		BlockPos charger = new BlockPos(2, 2, 4);
+		helper.setBlock(charger, engineFacing(Direction.DOWN));
+		helper.setBlock(new BlockPos(2, 3, 4), AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.DOWN));
+
+		// The discharging side: an engine on the vessel's north wall with a shaft to drive and
+		// nothing at all to drive it. Its own network, with no source and no capacity of its own.
+		BlockPos discharger = new BlockPos(2, 1, 2);
+		helper.setBlock(discharger, engineFacing(Direction.SOUTH));
+		helper.setBlock(new BlockPos(2, 1, 1), AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.Z));
+
+		// Enough to start a stroke on, so the discharging side does not spend the test waiting for
+		// the charging side to hand it a first whole one.
+		tankAt(helper, tank).fill(new FluidStack(CAESFluids.COMPRESSED_AIR.get(), 4000),
+			FluidAction.EXECUTE);
+
+		helper.runAfterDelay(SETTLE_TICKS + 30, () -> {
+			AirEngineBlockEntity charging = helper.getBlockEntity(charger);
+			AirEngineBlockEntity discharging = helper.getBlockEntity(discharger);
+
+			helper.assertTrue(charging.getMode() == EngineMode.COMPRESSING,
+				"the motor-driven engine should be charging the vessel, was " + charging.getMode());
+			helper.assertTrue(discharging.getMode() == EngineMode.GENERATING,
+				"the engine on the other network should be discharging it, was "
+					+ discharging.getMode());
+			helper.succeed();
+		});
+	}
+
+	/**
+	 * Two engines on one motor both charge, and the network-wide rule must not have stopped them.
+	 *
+	 * <p>The companion to {@code oneNetworkNeverChargesAndDischargesAtOnce}: a rule that refuses a
+	 * network running on its own stored air has to be able to tell that apart from a network with a
+	 * creative motor on it, and the allocation that shares one surplus between several compressors
+	 * has to actually hand it out. Both fail closed — as an engine that quietly never charges — so
+	 * neither would be noticed without this.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 250)
+	public static void twoCompressorsShareOneMotorsSurplus(GameTestHelper helper) {
+		floor(helper);
+
+		BlockPos westVessel = new BlockPos(2, 1, 5);
+		BlockPos upperVessel = new BlockPos(7, 2, 5);
+		helper.setBlock(westVessel, vessel());
+		helper.setBlock(upperVessel, vessel());
+
+		BlockPos westEngine = new BlockPos(3, 1, 5);
+		BlockPos upperEngine = new BlockPos(6, 2, 5);
+		helper.setBlock(westEngine, engineFacing(Direction.WEST));
+		helper.setBlock(upperEngine, engineFacing(Direction.EAST));
+
+		// One motor, two engines, joined by a pair of meshed cogwheels -- the same branch the
+		// three-engine rig uses, for the same reason.
+		helper.setBlock(new BlockPos(4, 1, 5), cogwheel());
+		helper.setBlock(new BlockPos(5, 1, 5), shaft());
+		helper.setBlock(new BlockPos(6, 1, 5), AllBlocks.CREATIVE_MOTOR.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.WEST));
+		helper.setBlock(new BlockPos(4, 2, 5), cogwheel());
+		helper.setBlock(new BlockPos(5, 2, 5), shaft());
+
+		helper.runAfterDelay(SETTLE_TICKS + 30, () -> {
+			AirEngineBlockEntity west = helper.getBlockEntity(westEngine);
+			AirEngineBlockEntity upper = helper.getBlockEntity(upperEngine);
+
+			helper.assertTrue(west.getMode() == EngineMode.COMPRESSING,
+				"the first engine should be charging off the motor, was " + west.getMode());
+			helper.assertTrue(upper.getMode() == EngineMode.COMPRESSING,
+				"the second engine should be too, was " + upper.getMode());
+			helper.assertTrue(tankAt(helper, westVessel).getFluidAmount() > 0
+				&& tankAt(helper, upperVessel).getFluidAmount() > 0,
+				"and both vessels should be filling");
+			helper.succeed();
+		});
+	}
+
 	// --- rig -----------------------------------------------------------------------------------
 
 	private static net.minecraft.world.level.block.state.BlockState vessel() {
@@ -1239,10 +1441,91 @@ public class CAESGameTests {
 			.defaultBlockState();
 	}
 
+	/** A shaft along X, which is the axis every rig in here runs its shaft line on. */
+	private static net.minecraft.world.level.block.state.BlockState shaft() {
+		return AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X);
+	}
+
+	/**
+	 * A cogwheel on the same axis. Two of these one above the other mesh, which is how a rig gets a
+	 * third engine onto a shaft that only has two ends.
+	 */
+	private static net.minecraft.world.level.block.state.BlockState cogwheel() {
+		return AllBlocks.COGWHEEL.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X);
+	}
+
 	private static net.minecraft.world.level.block.state.BlockState engineFacing(Direction facing) {
 		return CAESBlocks.AIR_ENGINE.get()
 			.defaultBlockState()
 			.setValue(AirEngineBlock.FACING, facing);
+	}
+
+	// --- the cross-mod convention ----------------------------------------------------------------
+
+	/**
+	 * The Air Engine is in {@code c:kinetic_energy_storage}, under that exact name.
+	 *
+	 * <p>This is the half of the convention that this mod owes everybody else. An engine's own refusal
+	 * to compress on borrowed capacity is worth nothing on its own: a Gravity Battery only leaves this
+	 * engine's charge alone because it can see this tag, and if the file goes missing, or the name
+	 * drifts, every other addon honouring the convention goes back to winding up on this vessel's air.
+	 * Nothing else in either mod would notice — which is exactly why the name is spelled out here
+	 * rather than read from {@link CAESTags}, so a consistent rename across the constant and the json
+	 * still fails.
+	 *
+	 * <p>The Pressure Vessel is deliberately <em>not</em> in the tag: it holds the air but turns
+	 * nothing, and the tag classifies kinetic sources.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 40)
+	public static void theAirEngineDeclaresItselfAsKineticStorage(GameTestHelper helper) {
+		TagKey<Block> convention = TagKey.create(Registries.BLOCK,
+			ResourceLocation.fromNamespaceAndPath("c", "kinetic_energy_storage"));
+		helper.assertTrue(CAESBlocks.AIR_ENGINE.get().defaultBlockState().is(convention),
+			"the Air Engine must be in c:kinetic_energy_storage, or every other addon honouring the "
+				+ "convention will go on compressing against its stored air");
+		helper.assertTrue(!CAESBlocks.PRESSURE_VESSEL.get().defaultBlockState().is(convention),
+			"the tag classifies kinetic sources, and a Pressure Vessel turns nothing");
+		helper.assertTrue(convention.location().equals(CAESTags.KINETIC_ENERGY_STORAGE.location()),
+			"CAESTags.KINETIC_ENERGY_STORAGE has drifted from the shared name: "
+				+ CAESTags.KINETIC_ENERGY_STORAGE.location());
+		helper.succeed();
+	}
+
+	/**
+	 * An engine's own generation is not counted as foreign borrowing.
+	 *
+	 * <p>{@link AirEngineBlockEntity#foreignStoredCapacityOnNetwork()} skips Air Engines because the
+	 * coalition has already taken them out of {@code externalCapacity}. Drop that exclusion and a
+	 * generating engine's capacity comes off the charging balance twice, which reads as a deficit that
+	 * is not there — so a network with one engine generating and real spare capacity from a motor would
+	 * refuse to compress on the motor's surplus.
+	 *
+	 * <p>This is what the suite can reach without a second mod on the classpath. The <em>foreign</em>
+	 * half — a tagged block that is not an Air Engine — is exercised by the identical scan in Create:
+	 * Gravity Batteries, whose own test uses a tagged source going down the same line. Proving the pair
+	 * together would need both mods in one dev runtime, which is a build-topology change rather than a
+	 * test.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void anEnginesOwnAirIsNotCountedAsBorrowedCapacity(GameTestHelper helper) {
+		rig(helper);
+		// A bare shaft, so the engine is the network's only possible source and starts generating.
+		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		fill(helper, 8000);
+
+		helper.runAfterDelay(SETTLE_TICKS + 20, () -> {
+			AirEngineBlockEntity be = engine(helper);
+			helper.assertTrue(be.getMode() == EngineMode.GENERATING,
+				"the rig should have the engine generating, so there is capacity to miscount; it was "
+					+ be.getMode() + "/" + be.getIdleReason());
+			helper.assertTrue(be.foreignStoredCapacityOnNetwork() == 0,
+				"an Air Engine's own capacity is the coalition's to subtract, not the tag scan's, but "
+					+ "the scan claimed " + be.foreignStoredCapacityOnNetwork() + " was borrowed");
+			helper.succeed();
+		});
 	}
 
 	private static void floor(GameTestHelper helper) {
@@ -1276,5 +1559,11 @@ public class CAESGameTests {
 	private static int air(GameTestHelper helper) {
 		return vessel(helper).getTankInventory()
 			.getFluidAmount();
+	}
+
+	/** The tank of whatever vessel {@code pos} belongs to, which is its controller's and not its own. */
+	private static SmartFluidTank tankAt(GameTestHelper helper, BlockPos pos) {
+		return ((PressureVesselBlockEntity) helper.getBlockEntity(pos)).getControllerBE()
+			.getTankInventory();
 	}
 }

@@ -105,8 +105,10 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
 | `engine/AirEngineBlockEntity` | The whole mod. Mode selection, the stress arithmetic, and the air accounting |
 | `engine/AirEngineBlock` | `DirectionalKineticBlock`; FACING points at the air, the shaft is on the opposite face |
 | `engine/EngineMode` | IDLE / COMPRESSING / GENERATING, persisted by ordinal and synced |
+| `AirEngineBlockEntity#networkEngines` | Every engine sharing one kinetic network. What makes charging and discharging mutually exclusive |
 | `vessel/PressureVesselBlockEntity` | A slim `IMultiBlockEntityContainer.Fluid`; Create's `ConnectivityHandler` does the multiblock |
 | `registry/CAESFluids` | Compressed Air: a real fluid with no block and no bucket |
+| `registry/CAESTags` | The `c:kinetic_energy_storage` convention, and why it is a tag rather than an API |
 | `client/AirEngineVisual` | The instanced flywheel and piston rod. This is what normally draws them |
 | `client/AirEngineRenderer` | The same two partials on the CPU path, for backends without instancing |
 | `client/PressureVesselCTBehaviour` | Connected textures, so a 3x3 tower is one tank and not nine crates |
@@ -121,17 +123,39 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
 
 ## Things that will bite you
 
-- **The engine measures the network *excluding itself*, and that is load-bearing.** An engine that
-  read total capacity minus total stress would compress, see the deficit its own draw created, flip
-  to generating, see the surplus its own capacity created, and flip back — once per tick, for ever.
-  `networkCapacityWithoutSelf`/`networkStressWithoutSelf` subtract `lastStressApplied` and
-  `lastCapacityProvided` — *the values the network actually has recorded*, not fresh calculations —
-  so the subtraction is exact. `theCompressorDoesNotSeeItsOwnDraw` and
+- **The engine measures the network *excluding every engine on it*, and that is load-bearing.** An
+  engine that read total capacity minus total stress would compress, see the deficit its own draw
+  created, flip to generating, see the surplus its own capacity created, and flip back — once per
+  tick, for ever. `networkCapacityWithoutSelf`/`networkStressWithoutSelf` subtract
+  `lastStressApplied` and `lastCapacityProvided` — *the values the network actually has recorded*,
+  not fresh calculations — so the subtraction is exact. `theCompressorDoesNotSeeItsOwnDraw` and
   `theMotorDoesNotSeeItsOwnCapacity` cover this and were both mutation-checked.
-- **`chargeMarginStress` is not a fudge factor, it is what refuses perpetual motion.** A compressor
-  needs strictly *more* spare capacity than it will draw. Without the margin, two engines back to
-  back on one shaft charge each other for ever — `twoEnginesOnOneShaftCannotChargeEachOther` fails
-  within a second of removing it.
+- **Excluding *itself* is not enough, and 0.1.2 shipped only that.** Two generators covering a third
+  engine's draw close the same loop through a longer path, and `chargeMarginStress` does not refuse
+  it — the margin was sized to stop one motor covering one compressor of its own tier, and a
+  compressor a tier below what drives it needs a fraction of the capacity on offer. So `decideMode`
+  works out `balance`: the network's capacity and stress with **every** Air Engine's contribution
+  subtracted, so the figure they all test does not move when any of them acts on it. The rule that
+  falls out is the one a player states — *a network is either charging or discharging, never both*.
+  `oneNetworkNeverChargesAndDischargesAtOnce` is the lock; with the coalition cut back to one engine
+  it reports 73 split ticks in 100, which is the reported bug exactly.
+- **The rule is keyed on the kinetic network, never on the vessel, and that is deliberate.** One
+  Pressure Vessel may serve engines on several networks, and standing between a network with power
+  spare and a network short of it is what a vessel is *for*. `aVesselBuffersBetweenTwoNetworks` is
+  the lock, and it is the test that would catch a "fix" that coordinated engines per vessel.
+- **`chargeMarginStress` is now the deadband, not the defence.** It still keeps a single engine from
+  flapping across the boundary, and `twoEnginesOnOneShaftCannotChargeEachOther` still passes, but
+  what refuses a self-charging loop of any size is the coalition arithmetic above. Don't restore the
+  old claim that the margin is what refuses perpetual motion; since 0.1.3 the margin could be zero
+  and the loop would still be refused.
+- **The coalition is cached, and walking it per engine per tick would not be affordable.**
+  `KineticNetwork.members` is every kinetic block in the player's factory. `networkEngines()` walks
+  it once per network per `COALITION_REFRESH_TICKS` and hands the result to every engine it found, so
+  the other engines have nothing to do but read it; a newly placed engine does not find itself in
+  its cached list, rebuilds on the spot, and tells the others about itself in the same breath.
+  Between walks `sharesNetworkWith` keeps the list honest at O(the engines) — breaking a shaft splits
+  a network without necessarily changing either half's id, and subtracting a departed engine's
+  contribution from a total that no longer contains it reads as capacity that is not there.
 - **A generator contributes at the speed it *declares*, not the speed it is spun at.** Measured, with
   two creative motors on one shaft: the 16 RPM one reads `theoretical=64` but still contributes
   `16384 × 16`, and the network total is the sum of each source at *its own* rate. So an engine that
@@ -161,9 +185,10 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   scan of the multiblock's outward faces — interior blocks have no face an engine could attach to,
   which is what keeps it cheap.
 - **Impact and capacity are deliberately the same number at the same tier.** That identity is what
-  makes `chargeMarginStress` sufficient to refuse a self-charging loop: a motor cannot cover a
-  compressor of its own tier *plus* the margin. Break the identity and
-  `twoEnginesOnOneShaftCannotChargeEachOther` fails within a second.
+  makes `chargeMarginStress` sufficient at the *equal-tier* pair the margin was sized for: a motor
+  cannot cover a compressor of its own tier *plus* the margin. Break the identity and
+  `twoEnginesOnOneShaftCannotChargeEachOther` fails within a second. Note what it does not buy —
+  mismatched tiers walk straight past it, which is half of why the coalition rule exists.
 - **Never fighting the network is the Steam Engine's flip, not a refusal to have a speed.**
   `applyNewSpeed` destroys a generator whose sign opposes a stronger network; it is perfectly happy
   with one that is merely slower. `alignDirectionWith` flips to agree with a shaft that is already
@@ -213,6 +238,12 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   for a position that is almost never an engine. `enginesAreCountedOnEveryFace` covers the caps, the
   walls and a decoy engine pointing the wrong way; an off-by-one in any slab silently *raises* a
   vessel's efficiency, so it would not otherwise announce itself.
+- **Three engines cannot sit in one straight line, which is why two rigs use cogwheels.** An engine
+  puts its shaft on one face only, so a shaft line reaches exactly the two engines at its ends. A
+  third hangs off a pair of meshed cogwheels — same axis, offset by one perpendicular to it — which
+  is what `oneNetworkNeverChargesAndDischargesAtOnce` and `twoCompressorsShareOneMotorsSurplus` do.
+  A shaft laid along X above an engine facing DOWN does *not* connect to it, and the symptom is a
+  silent `NOT_TURNING` rather than anything that looks like a rig error.
 - **A rotating block needs a Flywheel visual as well as a renderer, and the two must agree.** Create
   registers both for everything that turns — `STEAM_ENGINE` has `SteamEngineVisual` next to
   `SteamEngineRenderer`, and so do `POWERED_SHAFT` and `FLYWHEEL`. 0.1.1 shipped only the renderer, so
@@ -335,13 +366,14 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   the width — the hook supports per-footprint caps and an earlier version used them — but having
   three different ceilings was a rule Create does not have, and the point of this addon is to add as
   few of those as possible. `vesselsStopAtTheHeightCap` covers the cap itself.
-- **Four guards are deliberately untested, and each says so at its call site.** The `getSpeed()`
+- **Six guards are deliberately untested, and each says so at its call site.** The `getSpeed()`
   overstress check in `compress`, the `getSpeedTier() == 0` bail in `decideMode`, the 18-engine
-  ceiling, and the `lastComparatorLevel` invalidation in `refreshComparators`. The first three are
-  unreachable at the default config or need a rig no GameTest template can hold; the last is
-  observable only in a case where the guard would have let the sweep through anyway. Deleting any of
-  them leaves all 32 tests green. Don't delete them for having no test; do read the comment before
-  changing them.
+  ceiling, the `lastComparatorLevel` invalidation in `refreshComparators`, the `balance < 0` half of
+  `decideMode`'s generating test, and the refusing half of `fitsInChargingAllocation`. Most are
+  unreachable at the default config or need a rig no GameTest template can hold; the last two both
+  need a source whose surplus a couple of engines can exhaust, and a creative motor's is effectively
+  unbounded. Deleting any of them leaves all 37 tests green — each was mutation-checked to confirm
+  it. Don't delete them for having no test; do read the comment before changing them.
 - **Performance is asserted as counts of work, never as elapsed time.** A count is a property of the
   code and comes out identical on a laptop and on a CI runner; a microsecond budget is a property of
   whatever ran the build, and would either flake or be set so loose it caught nothing. So
@@ -424,10 +456,61 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   their own multiblocks and never merge with Create's Fluid Tanks, even though both implement the
   same interface. That is why subclassing `FluidTankBlockEntity` was not necessary.
 
+## The kinetic storage convention
+
+`c:kinetic_energy_storage` is a cross-mod block tag meaning **the capacity this block supplies to a
+kinetic network is drawn from a store it filled earlier, not generated.** An engine refuses to
+compress on capacity supplied by anything in it. Create: Gravity Batteries honours the same tag from
+its 0.1.1, and the two mods were written against each other to settle it.
+
+- **It generalises the coalition, it does not replace it.** `networkEngines()` can read a peer's
+  fields — `wantsToCompress`, its exact draw — which is what lets several compressors *share* one
+  surplus rather than the first one taking it. A tag cannot say any of that, so
+  `foreignStoredCapacityOnNetwork()` skips Air Engines entirely and the coalition goes on handling
+  them. Counting them in both places subtracts them twice, which reads as a deficit that is not there;
+  `anEnginesOwnAirIsNotCountedAsBorrowedCapacity` is the lock, verified against that mutation.
+- **It is a tag because only one bit has to cross the mod boundary.** Create already exposes
+  `KineticNetwork.sources` and `getActualCapacityOf`, so the amount needs no cooperation from the
+  other mod — and `getActualCapacityOf` multiplies by `getGeneratedSpeed()`, which is zero for a store
+  that is not currently spending, so the runtime half is answered too. A shared API artifact or a
+  NeoForge capability would both need a common class on the classpath and would only re-report a
+  number Create already gives you. The `c` namespace matters for the same reason the tag does: nobody
+  owns it, so **a pack author can add a third mod's block with a datapack** and fix an interaction
+  neither author has heard of.
+- **It comes out of what the charging allocation may spend, never out of `balance` itself.**
+  `fitsInChargingAllocation(coalition, balance - borrowed)`. A discharging store genuinely is holding
+  the network up, so the `wantsToGenerate` test must go on counting it — subtract it there and a
+  network one Gravity Battery is comfortably covering reads as a deficit to every engine on the shaft,
+  and they all start generating against a shortfall that does not exist.
+- **Tag the kinetic source, not the storage.** The Air Engine is in the tag; the Pressure Vessel,
+  which holds the air but turns nothing, is not. `theAirEngineDeclaresItselfAsKineticStorage` asserts
+  both.
+- **Declaring is a separate job from honouring, and only declaring is invisible when it breaks.** The
+  refusal above protects this mod's air; being *in* the tag is what protects everybody else's, and
+  nothing in this repo would fail if the json went missing or the name drifted. Hence a test that
+  spells `c:kinetic_energy_storage` out as a literal rather than reading it from `CAESTags` — a
+  consistent rename across the constant and the file passes every behaviour test and silently stops
+  the mod composing with anything.
+- **There is no cross-mod GameTest.** Standing an Air Engine and a Gravity Battery on one shaft needs
+  both mods in one dev runtime, so a cross-repo build dependency and a CI job that cannot run until
+  the sibling has published. The guarantee is split instead: each mod proves it declares itself, and
+  each proves it refuses tagged capacity. Two mods passing both compose, and that scales to mods that
+  do not exist yet, which an integration test against one named sibling does not.
+
 ## Balance
 
 One number ties rotation to air: `airPerStressUnit`, millibuckets moved per Stress Unit per tick.
 Charging multiplies it by `roundTripEfficiency`; discharging does not. The losses live in one place.
+
+**`roundTripEfficiency` defaults to 1.0, and that is considered rather than missing.** It was 0.7. A
+buffer's whole value is letting you size generation to average load rather than peak, so taxing the
+round trip charges for the feature; Create models no losses anywhere, its Steam Engine "efficiency"
+being a boiler *allocation* ratio rather than waste; and FE mods reach the same answer, storing
+losslessly and putting their losses in transmission where the player is making a decision. The
+argument specific to this mod is the strongest one: the vessel-size efficiency already charges a
+player for building small, so a flat round-trip loss on top taxed the same player twice. What refuses
+an engine compressing against a store is `foreignStoredCapacityOnNetwork()` and the coalition, at any
+setting — see *The kinetic storage convention*.
 
 Efficiency is `min(1, vesselBlocks / (blocksPerEngine × attachedEngines))`. The `min` is what makes
 the two headline figures fall out, both measured rather than derived:
@@ -445,6 +528,10 @@ worth doing.
 One height cap for every footprint (`vesselMaxHeight`, 32 by default), the same way Create's Fluid
 Tank does it. An earlier version had 8 / 12 / 16 per footprint; that was removed as a rule Create
 does not have.
+
+Several engines on one network share one balance rather than each measuring their own. They all
+walk the same coalition in the same position order and run the same arithmetic, so they allocate the
+surplus consistently without any of them being in charge and without a packet passing between them.
 
 **On throttling the compressor.** A compressor's draw is fixed by its tier and the network speed, so
 a tier-4 engine on a 32 RPM shaft needs 4,096su spare before it starts. That was considered and

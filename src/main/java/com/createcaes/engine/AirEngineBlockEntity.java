@@ -1,13 +1,19 @@
 package com.createcaes.engine;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 
 import com.createcaes.CAESConfig;
 import com.createcaes.CAESLang;
 import com.createcaes.registry.CAESFluids;
+import com.createcaes.registry.CAESTags;
 import com.createcaes.vessel.PressureVesselBlockEntity;
+import com.simibubi.create.content.kinetics.KineticNetwork;
 import com.simibubi.create.content.kinetics.base.GeneratingKineticBlockEntity;
 import com.simibubi.create.content.kinetics.base.IRotate;
+import com.simibubi.create.content.kinetics.base.KineticBlockEntity;
 import com.simibubi.create.foundation.blockEntity.behaviour.BlockEntityBehaviour;
 import com.simibubi.create.foundation.utility.CreateLang;
 
@@ -33,20 +39,30 @@ import org.jetbrains.annotations.Nullable;
  * The whole mod, really: one kinetic block that runs in both directions.
  *
  * <h2>How it decides</h2>
- * Every tick it works out the network's balance <em>excluding itself</em> — subtracting the very
- * numbers it last handed the network, so the sum is exact rather than approximate. Then:
+ * Every tick it works out what the kinetic network would be doing with <em>every</em> Air Engine on
+ * it taken out — subtracting the very numbers each of them last handed the network, so the sum is
+ * exact rather than approximate. Call that the network's balance. Then:
  *
  * <ul>
- * <li>if the rest of the network cannot carry its own load, it generates;
- * <li>if the rest of the network has spare capacity for its draw <em>plus a margin</em>, it compresses;
+ * <li>if the network cannot carry its own load, it generates;
+ * <li>if the network has spare capacity for its draw <em>plus a margin</em>, and something other than
+ * an Air Engine is providing that capacity, it compresses;
  * <li>otherwise it idles.
  * </ul>
  *
- * <p>Excluding itself is what makes this stable. A naive engine reads total capacity minus total
- * stress, starts compressing, sees the deficit its own draw created, flips to generating, sees the
- * surplus its own capacity created, and flips back — once per tick, forever. Excluding itself means
- * the quantity it tests does not move when it acts on it, and the margin leaves a band in the middle
- * where neither test fires.
+ * <p>Excluding the engines is what makes this stable, and it has to be all of them rather than only
+ * this one. A naive engine reads total capacity minus total stress, starts compressing, sees the
+ * deficit its own draw created, flips to generating, sees the surplus its own capacity created, and
+ * flips back — once per tick, forever. Excluding itself fixes that for a single engine; it does not
+ * fix it for three, where two generators cover a third's draw and the loop simply closes through a
+ * longer path. Excluding the whole coalition means the quantity every engine tests does not move
+ * when any of them acts on it, and the margin leaves a band in the middle where neither test fires.
+ *
+ * <p>The rule that falls out is the one a player would state: <strong>a kinetic network is either
+ * charging or discharging, never both.</strong> It is a property of the network rather than of the
+ * vessel, which is deliberate — one Pressure Vessel may serve engines on several separate networks,
+ * and buffering between a network that has power spare and a network that is short of it is exactly
+ * what it is for. See {@link #networkEngines()}.
  *
  * <h2>Speed and tiers</h2>
  * Generation copies Create's Steam Engine exactly. Efficiency comes from the size of the vessel the
@@ -112,6 +128,18 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 	 */
 	private static final int NO_AIR_COOLDOWN_TICKS = 20;
 
+	/**
+	 * How long a cached coalition is trusted before it is walked out of the network again.
+	 *
+	 * <p>Only a safety net, not the mechanism. An engine that does not find itself in its cached
+	 * list rebuilds on the spot, and a rebuild is handed to every engine it found — so a newly
+	 * placed engine joins its network's coalition on its first deciding tick and tells the others
+	 * about itself in the same breath. Departures are caught every tick by {@link #sharesNetworkWith},
+	 * which is why the interval can be this lazy: what is left for it is the case where a network
+	 * changes shape without any engine's network id changing with it.
+	 */
+	private static final int COALITION_REFRESH_TICKS = 20;
+
 	private EngineMode mode = EngineMode.IDLE;
 	private IdleReason idleReason = IdleReason.NONE;
 	private int warmup = WARMUP_TICKS;
@@ -136,6 +164,40 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 	private float airRate;
 	/** Ticks left before a discharge that ran dry may start again. See {@link #NO_AIR_COOLDOWN_TICKS}. */
 	private int airCooldown;
+
+	/**
+	 * The Air Engines sharing this engine's kinetic network, itself included, in a fixed order.
+	 *
+	 * <p>Server-side and transient. Every engine on a network holds the same list object, because
+	 * whichever of them rebuilds it hands the result to all the others — one walk of the network's
+	 * members serves the whole coalition rather than one walk per engine. See {@link #networkEngines()}.
+	 */
+	private List<AirEngineBlockEntity> coalition = List.of();
+	/** The network id {@link #coalition} was built for, so a split or a merge rebuilds it at once. */
+	@Nullable
+	private Long coalitionNetwork;
+	/** Ticks of trust left in {@link #coalition}. See {@link #COALITION_REFRESH_TICKS}. */
+	private int coalitionAge;
+
+	/**
+	 * Whether everything about this engine <em>except</em> the network's balance says it could
+	 * compress: it is turning, it has somewhere to put the air, and it is not needed as a generator.
+	 *
+	 * <p>Peers read it, which is the whole reason it is a field. The charging allocation in
+	 * {@link #fitsInChargingAllocation} has to know which engines are contending for the surplus
+	 * before it decides who gets it, and asking a peer to re-derive that would be circular — the
+	 * answer would depend on the allocation the allocation is trying to compute. Deliberately
+	 * independent of the balance for that reason, and it may be one tick stale, which the allocation
+	 * tolerates.
+	 */
+	private boolean wantsToCompress;
+
+	/**
+	 * Spare network capacity this engine may compress into, after the engines ahead of it in the
+	 * coalition have taken theirs. Display only — it is what the goggles quote against the engine's
+	 * draw — and synced because the client cannot walk a kinetic network's members to work it out.
+	 */
+	private float chargeAllowance;
 
 	/**
 	 * How many times this engine has changed mode.
@@ -324,6 +386,153 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 		return stress - ownStress();
 	}
 
+	/**
+	 * Capacity on this network that <em>another mod's</em> store is supplying rather than generating.
+	 *
+	 * <p>The same rule the coalition applies to this mod's own engines, for blocks whose fields cannot
+	 * be read. Membership of {@link CAESTags#KINETIC_ENERGY_STORAGE} is the entire contract: Create
+	 * already reports the amount through {@code getActualCapacityOf}, and reports it as zero for a
+	 * store that is not currently spending, so nothing else has to cross the mod boundary.
+	 *
+	 * <p><b>Foreign only.</b> Air Engines are excluded because the coalition has already taken them out
+	 * of {@code externalCapacity}, and it knows things a tag cannot say — {@code wantsToCompress}, each
+	 * peer's exact draw — which is what lets several compressors share one surplus instead of the first
+	 * one taking it. Counting them here as well would subtract them twice.
+	 *
+	 * <p>Cheap enough per tick: {@code sources} holds only the network's generators, not its members,
+	 * so this is a handful of entries rather than the whole factory — which is why it needs none of the
+	 * caching {@link #networkEngines()} does. Removed entries are skipped because Create only prunes
+	 * them on its next capacity recalculation, and a stale one here would be capacity subtracted twice.
+	 */
+	public float foreignStoredCapacityOnNetwork() {
+		if (!hasNetwork())
+			return 0;
+		KineticNetwork kinetics = getOrCreateNetwork();
+		float stored = 0;
+		for (KineticBlockEntity source : kinetics.sources.keySet()) {
+			if (source instanceof AirEngineBlockEntity || source.isRemoved())
+				continue;
+			if (source.getBlockState().is(CAESTags.KINETIC_ENERGY_STORAGE))
+				stored += kinetics.getActualCapacityOf(source);
+		}
+		return stored;
+	}
+
+	// --- the coalition ----------------------------------------------------------------------
+
+	/**
+	 * Every Air Engine on this engine's kinetic network, itself included, in ascending position
+	 * order.
+	 *
+	 * <p>The order is what lets the engines agree on who gets the surplus without talking to each
+	 * other: they all walk the same list in the same order and run the same arithmetic, so they
+	 * reach the same answer independently. Positions are stable, which a hash order is not.
+	 *
+	 * <p>Cost is why it is cached. {@code KineticNetwork.members} is every kinetic block in the
+	 * factory, and walking it once per engine per tick would put the size of the player's base into
+	 * a loop that runs twenty times a second. So the walk happens once per network per
+	 * {@link #COALITION_REFRESH_TICKS}, and the engine that does it hands the result to everyone it
+	 * found — the other engines then have nothing to do but read it. Between walks the list is kept
+	 * honest by {@link #sharesNetworkWith}, which is O(the engines) rather than O(the factory).
+	 */
+	private List<AirEngineBlockEntity> networkEngines() {
+		if (coalitionAge > 0 && Objects.equals(coalitionNetwork, network) && coalition.contains(this)) {
+			coalitionAge--;
+			return coalition;
+		}
+		return rebuildCoalition();
+	}
+
+	private List<AirEngineBlockEntity> rebuildCoalition() {
+		List<AirEngineBlockEntity> found = new ArrayList<>();
+		if (hasNetwork()) {
+			KineticNetwork kinetics = getOrCreateNetwork();
+			for (KineticBlockEntity member : kinetics.members.keySet())
+				if (member instanceof AirEngineBlockEntity engine && !engine.isRemoved())
+					found.add(engine);
+		}
+		// A member map that has not caught up with this engine yet must not leave it out of its own
+		// coalition, or it would read the network as if it were not on it.
+		if (!found.contains(this))
+			found.add(this);
+		found.sort(Comparator.comparingLong(engine -> engine.worldPosition.asLong()));
+
+		List<AirEngineBlockEntity> shared = List.copyOf(found);
+		for (AirEngineBlockEntity engine : shared) {
+			engine.coalition = shared;
+			engine.coalitionNetwork = network;
+			engine.coalitionAge = COALITION_REFRESH_TICKS;
+		}
+		return shared;
+	}
+
+	/**
+	 * Whether a cached coalition entry is still one of this engine's peers.
+	 *
+	 * <p>Checked on every use rather than only on a rebuild. Breaking a shaft splits a network
+	 * without necessarily changing either half's id, and an engine that has left still appears in
+	 * the stale list — subtracting its contribution from a network total that no longer contains it
+	 * would read as capacity that is not there.
+	 */
+	private boolean sharesNetworkWith(AirEngineBlockEntity engine) {
+		return !engine.isRemoved() && Objects.equals(engine.network, network);
+	}
+
+	/**
+	 * Whether a stress figure is zero as far as the network is concerned.
+	 *
+	 * <p>Taking every engine's contribution back out of a total those engines are most of leaves two
+	 * nearly equal floats subtracted from each other, and that does not reliably land on zero. The
+	 * slack is relative because the totals are: a network's capacity is thousands of Stress Units, so
+	 * an absolute epsilon would be either useless at the top of the range or wrong at the bottom.
+	 */
+	private static boolean isNegligible(float value, float scale) {
+		return value <= 1.0E-5F * Math.max(1F, Math.abs(scale));
+	}
+
+	/**
+	 * Draw already spoken for by the engines ahead of this one, and whether this one still fits.
+	 *
+	 * <p>Every engine runs this over the same list in the same order, so they allocate the shared
+	 * surplus consistently without any of them being in charge. An engine that does not fit is
+	 * skipped rather than ending the walk, so a large engine at the front cannot starve a small one
+	 * behind it.
+	 *
+	 * <p>Contention is read off {@link #wantsToCompress}, which may be a tick old. The cost of that
+	 * is one tick: engines that all start wanting to compress on the same tick see each other's flag
+	 * still clear and may collectively overdraw once, at which point the network is overstressed,
+	 * {@code getSpeed()} is zero and {@link #compress} moves no air anyway. From the following tick
+	 * the flags are set and the allocation is stable. The {@code balance < 0} half of the generating
+	 * test in {@link #decideMode} is what keeps that one tick from recruiting generators.
+	 *
+	 * <p>Half of this is covered: {@code twoCompressorsShareOneMotorsSurplus} fails if it stops
+	 * handing the surplus out. The other half — several compressors contending for a surplus too
+	 * small for all of them — is <strong>not covered by a test</strong>, because provoking it needs a
+	 * source whose capacity a couple of engines can exhaust and a creative motor's is effectively
+	 * unbounded. At one engine it reduces exactly to the test it replaced, which the rest of the
+	 * suite still covers.
+	 */
+	private boolean fitsInChargingAllocation(List<AirEngineBlockEntity> coalition, float balance) {
+		float margin = CAESConfig.chargeMarginStress();
+		float spent = 0;
+		for (AirEngineBlockEntity engine : coalition) {
+			boolean self = engine == this;
+			if (!self && (!sharesNetworkWith(engine)
+				|| !(engine.wantsToCompress || engine.mode == EngineMode.COMPRESSING)))
+				continue;
+			float draw = engine.getCompressorDraw();
+			if (self) {
+				chargeAllowance = balance - spent;
+				return draw > 0 && spent + draw + margin <= balance;
+			}
+			if (spent + draw + margin <= balance)
+				spent += draw;
+		}
+		// Unreachable: networkEngines() guarantees this engine is in its own coalition.
+		chargeAllowance = balance;
+		return false;
+	}
+
 	// --- the loop ---------------------------------------------------------------------------
 
 	@Override
@@ -369,16 +578,44 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 
 	private EngineMode decideMode(@Nullable IFluidHandler air) {
 		if (!IRotate.StressImpact.isEnabled())
-			return idle(IdleReason.NONE);
+			return idleWithoutCompressing(IdleReason.NONE);
 		if (air == null)
-			return idle(IdleReason.NO_SUPPLY);
+			return idleWithoutCompressing(IdleReason.NO_SUPPLY);
 		// No rating means no mode it could act on: it would report "Generating" while supplying
 		// nothing, or blame the network for a shortfall that is really an empty tier. Unreachable at
 		// the default config -- a vessel always gives at least 1/blocksPerEngine and a pipe gives
 		// pipeFedEfficiency -- so it is defence for someone setting pipeFedEfficiency to 0, and is
 		// **not covered by a test** for that reason.
 		if (getSpeedTier() == 0)
-			return idle(IdleReason.NO_SUPPLY);
+			return idleWithoutCompressing(IdleReason.NO_SUPPLY);
+
+		// What the network would be doing with no Air Engine on it at all. Every engine's own
+		// contribution comes out, not just this one's, and it comes out as the value the network has
+		// recorded for it rather than as a fresh calculation, so the subtraction is exact.
+		List<AirEngineBlockEntity> coalition = networkEngines();
+		float externalCapacity = capacity;
+		float externalStress = stress;
+		boolean peerGenerating = false;
+		for (AirEngineBlockEntity engine : coalition) {
+			if (engine != this && !sharesNetworkWith(engine))
+				continue;
+			externalCapacity -= engine.ownCapacity();
+			externalStress -= engine.ownStress();
+			if (engine != this && engine.mode == EngineMode.GENERATING)
+				peerGenerating = true;
+		}
+		float balance = externalCapacity - externalStress;
+
+		// Capacity a foreign store is putting on the network -- a Gravity Battery letting its weight
+		// down, say. Compressing on it would be the same round-trip loop `peerGenerating` refuses
+		// below, across a mod boundary instead of within one.
+		//
+		// Deliberately *not* taken out of `balance` itself, only out of what the charging allocation
+		// may spend. A discharging store is genuinely holding this network up, so an engine deciding
+		// whether to *generate* must go on counting it: subtract it here and a network one battery is
+		// comfortably covering reads as a deficit to every engine on it, and they all start generating
+		// against a shortfall that does not exist.
+		float borrowed = foreignStoredCapacityOnNetwork();
 
 		float headroom = networkCapacityWithoutSelf() - networkStressWithoutSelf();
 
@@ -388,8 +625,24 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 		boolean soleSource =
 			!hasSource() && networkCapacityWithoutSelf() <= 0 && hasSomethingToDrive();
 
-		boolean wantsToGenerate = headroom < 0 || soleSource;
+		// The deficit has to be the network's own, not one the coalition dug for it. The
+		// self-excluded headroom is still the second half of the test, because that is what shares
+		// one real deficit between several engines -- each sees it shrink as the others take it up,
+		// and stops once it is covered.
+		//
+		// In steady state the coalition half is redundant: the charging allocation below never hands
+		// out more than `balance`, so a compressor cannot be what drove the headroom negative. It is
+		// here for the tick where it can -- several engines starting together see each other's
+		// wantsToCompress still clear and may overdraw once -- and without it that one tick would
+		// call every generator on the network into service, which is the flap the whole design is
+		// arranged to avoid. Like the other transient guards it is **not covered by a test**:
+		// provoking the overshoot needs a source whose surplus is small enough to exhaust, and a
+		// creative motor is the only source a GameTest rig can hold. Verified by mutation that
+		// removing it leaves all 37 green.
+		boolean wantsToGenerate = (balance < 0 && headroom < 0) || soleSource;
 		if (wantsToGenerate) {
+			wantsToCompress = false;
+			chargeAllowance = 0;
 			// Two gates, and both are hysteresis rather than gameplay. The cooldown keeps a supply
 			// that cannot keep up from flipping the mode every few ticks, and the affordability test
 			// asks for a whole stroke rather than the single millibucket this used to accept -- an
@@ -405,16 +658,49 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 
 		float speed = Math.abs(getTheoreticalSpeed());
 		if (speed == 0)
-			return idle(IdleReason.NOT_TURNING);
-		if (!hasRoom(air))
-			return idle(IdleReason.VESSEL_FULL);
+			return idleWithoutCompressing(IdleReason.NOT_TURNING);
 
-		float draw = getCompressorDraw();
-		if (draw > 0 && headroom >= draw + CAESConfig.chargeMarginStress()) {
+		// A network with no capacity of its own is turning on stored air, whoever is spending it, so
+		// there is nothing here to charge from -- putting it back would be the network paying itself,
+		// at a round-trip loss, for ever.
+		//
+		// The allocation below would refuse this anyway, since `balance` cannot be positive when
+		// nothing outside the coalition is providing capacity. This states the rule instead of
+		// leaving it to fall out of the arithmetic, which is worth doing for two reasons: it is what
+		// puts a reason on the goggles a player can act on, rather than "not enough spare capacity"
+		// against a network that looks to them like it has plenty; and the peer test holds on the
+		// tick a failover starts, before the network's totals have caught up with it. Removing it
+		// fails oneNetworkNeverChargesAndDischargesAtOnce on the reported reason.
+		if (peerGenerating || isNegligible(externalCapacity, capacity))
+			return idleWithoutCompressing(IdleReason.NETWORK_ON_AIR);
+
+		if (!hasRoom(air))
+			return idleWithoutCompressing(IdleReason.VESSEL_FULL);
+
+		wantsToCompress = true;
+		if (fitsInChargingAllocation(coalition, balance - borrowed)) {
 			idleReason = IdleReason.NONE;
 			return EngineMode.COMPRESSING;
 		}
-		return idle(IdleReason.NO_SURPLUS);
+		// Which of the two shortfalls this is, exactly rather than approximately: the allocation has
+		// just left this engine's share in chargeAllowance, so adding the borrowing back says whether
+		// that alone was the difference. Worth the line because the two look identical on a
+		// Stressometer -- a network whose surplus is borrowed reads as a network with plenty, and
+		// "not enough spare capacity" would send a player looking for a generator they already have.
+		boolean borrowingWasTheDifference = borrowed > 0
+			&& chargeAllowance + borrowed >= getCompressorDraw() + CAESConfig.chargeMarginStress();
+		return idle(borrowingWasTheDifference
+			? IdleReason.NETWORK_ON_STORED_POWER : IdleReason.NO_SURPLUS);
+	}
+
+	/**
+	 * Idles for a reason that also means this engine is not contending for the network's surplus, so
+	 * the engines behind it in the coalition may have what it was reserving.
+	 */
+	private EngineMode idleWithoutCompressing(IdleReason reason) {
+		wantsToCompress = false;
+		chargeAllowance = 0;
+		return idle(reason);
 	}
 
 	private EngineMode idle(IdleReason reason) {
@@ -596,6 +882,7 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 		compound.putFloat("RememberedSpeed", rememberedSpeed);
 		compound.putFloat("Efficiency", efficiency);
 		compound.putFloat("AirRate", airRate);
+		compound.putFloat("ChargeAllowance", chargeAllowance);
 		if (!clientPacket) {
 			compound.putFloat("AirBuffer", airBuffer);
 			compound.putInt("AirCooldown", airCooldown);
@@ -612,6 +899,7 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 		rememberedSpeed = compound.getFloat("RememberedSpeed");
 		efficiency = compound.getFloat("Efficiency");
 		airRate = compound.getFloat("AirRate");
+		chargeAllowance = compound.getFloat("ChargeAllowance");
 		if (!clientPacket) {
 			airBuffer = compound.getFloat("AirBuffer");
 			airCooldown = compound.getInt("AirCooldown");
@@ -650,12 +938,16 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 				.style(ChatFormatting.GRAY)
 				.forGoggles(tooltip, 2);
 			if (idleReason == IdleReason.NO_SURPLUS) {
-				float available = networkCapacityWithoutSelf() - networkStressWithoutSelf();
+				// The engine's own share of the network's spare capacity, not the whole of it: on a
+				// network running several engines the ones ahead of this one have already taken
+				// theirs, and quoting a figure this engine cannot have would read as a bug.
+				// Computed on the server and synced, because working it out means walking the
+				// network's members and the client has no such network to walk.
 				CAESLang
 					.translate("tooltip.air_engine.needs",
 						CreateLang.number(getCompressorDraw())
 							.translate("generic.unit.stress"),
-						CreateLang.number(Math.max(0, available))
+						CreateLang.number(Math.max(0, chargeAllowance))
 							.translate("generic.unit.stress"))
 					.style(ChatFormatting.DARK_GRAY)
 					.forGoggles(tooltip, 2);

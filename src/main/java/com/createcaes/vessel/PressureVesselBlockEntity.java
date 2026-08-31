@@ -455,7 +455,7 @@ public class PressureVesselBlockEntity extends SmartBlockEntity
 	 * neighbours have to be re-told even when the reading itself is unchanged — the guard above is
 	 * about a level that has not moved, not about a shape that has.
 	 *
-	 * <p>The invalidation is <strong>not covered by a test</strong>, and deleting it leaves all 31
+	 * <p>The invalidation is <strong>not covered by a test</strong>, and deleting it leaves all 37
 	 * GameTests green. Growing or splitting a vessel changes its capacity, so in practice the
 	 * reading moves too and the guard would have let the sweep through anyway; a case where the shape
 	 * changes and the level does not needs air added in exact proportion to the blocks. It is here

@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.1.3
+
+One balance fix, and it changes how a network with several Air Engines on it behaves. An 0.1.2 world
+loads unchanged; a factory running a single engine, or engines on separate networks, behaves exactly
+as it did.
+
+- **A kinetic network is now either charging or discharging, never both at once.** An engine used to
+  measure the network's balance with only *its own* contribution taken out, which is enough to stop
+  one engine chasing its own tail but not enough to stop several chasing each other's. Reported with
+  three engines on one shaft: two generating, and the third charging off what they supplied --
+  turning stored air back into stored air at the round-trip loss, for ever. `chargeMarginStress` did
+  not refuse it, because it was only ever sized to stop one motor covering one compressor of its own
+  tier, and a compressor a tier below what is driving it draws a fraction of the capacity on offer.
+  Every engine now measures the network with *every* engine's contribution taken out, so the figure
+  they all test does not move when any of them acts on it. Measured on the reported rig: 73 ticks in
+  100 had one engine generating while another compressed; now none do.
+- **An engine no longer compresses on capacity another mod's store is supplying**, by the same rule
+  and for the same reason. The balance test above takes every *Air Engine* out of the network's
+  capacity, which cannot see a Create: Gravity Batteries weight letting itself down -- so a battery
+  paid for an engine's compression, at the round-trip loss, across the mod boundary. Keyed on the new
+  `c:kinetic_energy_storage` tag rather than on either mod's classes, so it covers addons neither
+  author has heard of, and a pack can add a third mod's block to the tag with a datapack. The Air
+  Engine declares itself in that tag, which is what makes the other side of the bargain work.
+- **`roundTripEfficiency` now defaults to 1.0 — an engine gives back exactly the air it paid for.** It
+  was 0.7. A vessel is a buffer, and sizing generation to average load instead of peak is the reason to
+  build one, so charging for the round trip was charging for the feature; Create itself models no
+  losses anywhere; and this mod already makes you pay for building small through the vessel-size
+  efficiency, so a flat loss on top taxed the same player twice. The knob remains for packs that want
+  storage to cost something, and it was never what stopped one store charging another. **Existing
+  worlds keep 0.7**, since the value is already written to their server config — delete the line, or
+  set it to 1.0, to pick up the new default.
+- Goggles distinguish the two shortfalls: an engine that will not compress because the surplus is
+  coming from some *other* mod's store says so, rather than reporting the network as short.
+- **A Pressure Vessel can still buffer between two networks, and that is the point of the rule being
+  about networks rather than vessels.** An engine charging a vessel off a network with power to spare
+  and a second engine discharging that same vessel into a network that is short of it is the mod
+  working as intended, and it keeps working.
+- **Several compressors on one network now share the surplus instead of all claiming it.** Each
+  engine takes its slice in a fixed order that every engine on the network agrees on, so two engines
+  can no longer both start on a surplus with room for one and then overstress the network between
+  them.
+- **The goggles say when a network is running on stored air.** An engine that would charge but must
+  not now reports that, rather than "not enough spare capacity" against a network that to a player
+  looks like it has plenty. The spare capacity it does quote is now this engine's own share of it.
+
 ## 0.1.2
 
 Performance, on the server tick, plus one balance leak the same code path was causing. An 0.1.1

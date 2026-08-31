@@ -9,7 +9,10 @@ import org.apache.commons.lang3.tuple.Pair;
  *
  * <p>The one number that ties rotation to air is {@link #airPerStressUnit}: millibuckets moved per
  * Stress Unit per tick. Charging multiplies it by {@link #roundTripEfficiency}; discharging does not.
- * That is the whole energy model — the losses live in one place.
+ * That is the whole energy model, and the one-sidedness is what keeps a setting below 1.0 a cost
+ * rather than a gain. The default <em>is</em> 1.0 — the round trip is lossless out of the box, and
+ * what refuses an engine compressing against another store is the {@code c:kinetic_energy_storage}
+ * tag rather than any loss.
  *
  * <p>Power comes from {@link #maxStress} scaled by an efficiency the engine works out from the size
  * of its vessel, exactly the way a Steam Engine works it out from the size of its boiler. Duration
@@ -68,8 +71,16 @@ public class CAESConfig {
 			.comment("Millibuckets of Compressed Air per Stress Unit per tick.")
 			.defineInRange("airPerStressUnit", 0.04, 0.0001, 100.0);
 		roundTripEfficiency = builder
-			.comment("Fraction of compression work recovered on the way back out.")
-			.defineInRange("roundTripEfficiency", 0.7, 0.01, 1.0);
+			.comment("Fraction of compression work recovered on the way back out. 1.0 by default: an",
+				"engine and vessel are a buffer, and sizing generation to average load instead of",
+				"peak is the reason to install one, so a storage tax charges for the feature.",
+				"Create models no losses anywhere -- a water wheel, a belt and a gearbox are all",
+				"free -- and this mod already charges for building small through the vessel-size",
+				"efficiency below, so a flat loss on top taxed the same player twice.",
+				"Lower it if your pack wants storage to cost something. It is NOT what stops an",
+				"engine compressing against another store: the c:kinetic_energy_storage tag does",
+				"that, at any setting including 1.0.")
+			.defineInRange("roundTripEfficiency", 1.0, 0.01, 1.0);
 		chargeMarginStress = builder
 			.comment("Stress capacity a network must have spare, on top of the compressor's own draw,",
 				"before the compressor will start. This is the deadband that stops an engine",

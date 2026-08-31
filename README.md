@@ -87,7 +87,14 @@ and remembers it, so switching to a motor keeps the rotation exactly as it was.
 ## Balance
 
 One number ties rotation to air: `airPerStressUnit`, millibuckets per Stress Unit per tick. Charging
-multiplies it by `roundTripEfficiency` (0.7 by default); discharging does not.
+multiplies it by `roundTripEfficiency`; discharging does not.
+
+`roundTripEfficiency` is **1.0 by default** — the round trip is lossless. An engine and its vessel are
+a buffer, and sizing generation to average load instead of peak is the reason to build one; Create
+charges nothing for a water wheel, a belt or a gearbox; and this mod already makes you pay for
+building small through the vessel-size efficiency below. Lower it if your pack wants storage to cost
+something. It is not what stops an engine compressing against another store — the
+`c:kinetic_energy_storage` tag does that, at any setting.
 
 Efficiency is `min(1, min(18, vesselBlocks / 9) / attachedEngines)` — the same shape as Create's
 boiler, which is `min(18, boilerSize / 4)` shared between the engines on it. Two figures fall out:

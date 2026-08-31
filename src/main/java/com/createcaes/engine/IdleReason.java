@@ -18,7 +18,20 @@ public enum IdleReason {
 	/** It would compress, but the shaft is not turning. */
 	NOT_TURNING("not_turning"),
 	/** It would compress, but the network has no capacity to spare for it. */
-	NO_SURPLUS("no_surplus");
+	NO_SURPLUS("no_surplus"),
+	/**
+	 * It would compress, but the only thing turning this network is an Air Engine — so the rotation
+	 * on offer is stored air being spent, and charging off it would be a network paying itself.
+	 */
+	NETWORK_ON_AIR("network_on_air"),
+	/**
+	 * It would compress, but the capacity on offer is coming from some other mod's store — a Gravity
+	 * Battery letting its weight down, say. Same loop {@link #NETWORK_ON_AIR} refuses, across a mod
+	 * boundary instead of within one, and reported separately because the two send a player to
+	 * different blocks. Classified by the {@code c:kinetic_energy_storage} tag, so it covers addons
+	 * this one has never heard of.
+	 */
+	NETWORK_ON_STORED_POWER("network_on_stored_power");
 
 	private final String name;
 
