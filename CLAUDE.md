@@ -398,6 +398,22 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
 - **Faces buried inside the multiblock still need their CT context built.**
   `buildContextForOccludedDirections` returning true is what stops every course growing a border
   along its top edge.
+- **Forming a vessel changes no blockstate, so the client has to be told to redraw by hand.**
+  Connected textures are baked into the chunk section mesh and `connectsTo` asks
+  `ConnectivityHandler.isConnected`, which reads the `Controller` off the client's copy of the block
+  entity — so a section only picks up a new connection when something re-renders it. Create's Fluid
+  Tank never has to think about this: its windows are blockstate properties, so forming a multi moves
+  a property on every part and the state change re-renders on its own. Ours has only TOP and BOTTOM,
+  and **every block of a one-course vessel is both, before and after** — `notifyMultiUpdated`'s
+  `setBlock` is then a no-op that sends nothing, and `sendData` is throttled to 8 ticks on top. Every
+  release through 0.1.2 shipped without the redraw request, so a flat 3x3 went on rendering as nine
+  crates until a second course landed and finally moved TOP on the course below; splitting one back
+  apart was stale the same way. The fix is the `level.sendBlockUpdated(...)` in `read`'s
+  `clientPacket` branch, copied from `FluidTankBlockEntity`, and `invalidateRenderBoundingBox` next
+  to it is *not* a substitute — it sizes a renderer's culling box, and the vessel has no renderer at
+  all. **No GameTest can see this**: a dedicated server builds no meshes, and all 37 passed with it
+  broken. `runClient` is the only check, and what to look at is a single course placed flat, not a
+  stack.
 - **Everything about a Ponder scene fails silently.** A missing structure, a bad block state and a
   missing lang key all produce a *completely clean* client log at startup and only go wrong when a
   player opens the scene. Two guards, because one cannot cover both halves:

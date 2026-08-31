@@ -44,6 +44,13 @@ as it did.
 - **The goggles say when a network is running on stored air.** An engine that would charge but must
   not now reports that, rather than "not enough spare capacity" against a network that to a player
   looks like it has plenty. The spare capacity it does quote is now this engine's own share of it.
+- **A flat Pressure Vessel now *looks* joined the moment it is joined.** Reported: a 3x3 first course
+  went on rendering as nine separate crates until a second course was stacked on it, at which point
+  the whole thing snapped together. The multiblock had formed correctly the whole time -- it held the
+  right amount of air and drove engines at the right tier -- but the client was never told to redraw.
+  Connected textures are baked into the chunk mesh, and a one-course vessel forms without a single
+  block property changing (every block of it is both the top and the bottom, before and after), so
+  nothing asked for a redraw. Breaking one apart was stale in the same way.
 
 ## 0.1.2
 

@@ -26,6 +26,7 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtUtils;
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.BlockEntityType;
 import net.minecraft.world.level.block.state.BlockState;
@@ -545,8 +546,25 @@ public class PressureVesselBlockEntity extends SmartBlockEntity
 
 		if (clientPacket) {
 			boolean changeOfController = !Objects.equals(controllerBefore, controller);
-			if ((changeOfController || prevSize != width || prevHeight != height) && hasLevel())
+			if ((changeOfController || prevSize != width || prevHeight != height) && hasLevel()) {
+				// Ask the client to redraw this block's chunk section. Connected textures are baked
+				// into the section mesh and PressureVesselCTBehaviour joins two faces by asking
+				// ConnectivityHandler.isConnected, which reads the Controller this packet just
+				// delivered -- so without a re-render the section keeps whatever it was last drawn
+				// with, and this packet is the only notice the client ever gets.
+				//
+				// Create's Fluid Tank makes the same call and never has to rely on it: its windows
+				// are blockstate properties, so forming a multi changes a property on every part
+				// and the state change re-renders on its own. Ours are not. A 3x3x1 vessel forms
+				// without a single property moving -- every block of a one-course vessel is both
+				// TOP and BOTTOM before and after -- so notifyMultiUpdated's setBlock is a no-op
+				// and nothing else asks. The symptom is a flat 3x3 that goes on rendering as nine
+				// crates until a second course lands and finally moves TOP on the course below.
+				// Splitting one back apart was stale the same way, in the other direction.
+				level.sendBlockUpdated(worldPosition, getBlockState(), getBlockState(),
+					Block.UPDATE_KNOWN_SHAPE);
 				invalidateRenderBoundingBox();
+			}
 		}
 	}
 
