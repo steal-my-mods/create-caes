@@ -20,6 +20,7 @@ import com.createcaes.registry.CAESFluids;
 import com.createcaes.vessel.PressureVesselBlock;
 import com.createcaes.vessel.PressureVesselBlockEntity;
 import com.simibubi.create.AllBlocks;
+import com.simibubi.create.api.stress.BlockStressValues;
 import com.simibubi.create.content.kinetics.base.KineticBlockEntity;
 import com.simibubi.create.content.kinetics.motor.CreativeMotorBlockEntity;
 import com.simibubi.create.foundation.fluid.SmartFluidTank;
@@ -269,8 +270,12 @@ public class CAESGameTests {
 			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
 		helper.setBlock(DRIVER.west(), AllBlocks.COGWHEEL.getDefaultState()
 			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		// Powered, i.e. disengaged, which is the shape that was actually reported: a disengaged clutch
+		// splits the network, so what refuses beyond it is the walk's edge test rather than the relay
+		// tag. The default state is engaged and would only have exercised a third relay.
 		helper.setBlock(DRIVER.west().west(), AllBlocks.CLUTCH.getDefaultState()
-			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X)
+			.setValue(BlockStateProperties.POWERED, true));
 		fill(helper, 8000);
 		int before = air(helper);
 
@@ -1492,6 +1497,40 @@ public class CAESGameTests {
 		return CAESBlocks.AIR_ENGINE.get()
 			.defaultBlockState()
 			.setValue(AirEngineBlock.FACING, facing);
+	}
+
+	/**
+	 * A load that draws no stress is still a load.
+	 *
+	 * <p>The companion to {@link #aChargedEngineOnABareShaftHoldsItsAir}, and it exists because the
+	 * first version of that guard measured stress impact and was a regression. Create registers
+	 * {@code belt} with {@code setNoImpact}; so are {@code gantry_shaft}, {@code flywheel} and
+	 * {@code display_board}. A belt network is the most ordinary load in the game and draws exactly
+	 * zero, so an engine keyed on impact would sit and watch a base go dark — while still spinning up
+	 * for a bare shaft, which draws zero as well.
+	 *
+	 * <p>A Gantry Shaft rather than a belt because it is one block and one state: belts need a pulley at
+	 * each end, and the subject here is the classification, not the machine.
+	 */
+	@GameTest(template = "test_rig", timeoutTicks = 200)
+	public static void anEngineDrivesALoadThatDrawsNoStress(GameTestHelper helper) {
+		rig(helper);
+		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		helper.setBlock(DRIVER.west(), AllBlocks.GANTRY_SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+		fill(helper, 8000);
+
+		helper.runAfterDelay(SETTLE_TICKS + 30, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			helper.assertTrue(BlockStressValues.getImpact(AllBlocks.GANTRY_SHAFT.get()) == 0,
+				"this test is pointless unless a Gantry Shaft still draws no stress; Create now says "
+					+ BlockStressValues.getImpact(AllBlocks.GANTRY_SHAFT.get()));
+			helper.assertTrue(engine.getMode() == EngineMode.GENERATING,
+				"a zero-impact load is still a load and the engine should be carrying it; it is "
+					+ engine.getMode() + "/" + engine.getIdleReason());
+			helper.succeed();
+		});
 	}
 
 	// --- the cross-mod convention ----------------------------------------------------------------

@@ -747,11 +747,12 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 	 * charged engine sitting in a chest room would not spin itself against nothing"; a chest room had
 	 * simply been implemented as <em>no kinetic neighbour</em> rather than <em>no demand</em>.
 	 *
-	 * <p>Latent impact, not {@link #networkStressWithoutSelf()}. Create scales stress by speed —
-	 * {@code getActualStressOf} multiplies the recorded impact by {@code |getTheoreticalSpeed()|} — so on
-	 * a network nothing is turning, every member reports zero stress however much machinery is bolted to
-	 * it. Testing the stress total would have read "no load" at exactly the moment an engine decides
-	 * whether to take over, and failover would never have happened again.
+	 * <p>Not {@link #networkStressWithoutSelf()}, for two reasons, and see {@link #wantsPower} for the
+	 * second and worse one. First: Create scales stress by speed — {@code getActualStressOf} multiplies
+	 * the recorded impact by {@code |getTheoreticalSpeed()|} — so on a network nothing is turning, every
+	 * member reports zero however much machinery is bolted to it, and testing the total would have read
+	 * "no load" at exactly the moment an engine decides whether to take over. Second: a great many real
+	 * loads draw no stress at all, so even per-block impact is not a load test.
 	 *
 	 * <p><b>A stopped Create network does not exist</b>, which is what makes this harder than it looks.
 	 * {@code KineticBlockEntity.network} is only ever assigned from {@code setSource}, which copies it
@@ -771,8 +772,8 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 		if (level == null)
 			return false;
 		if (hasNetwork()) {
-			for (Map.Entry<KineticBlockEntity, Float> entry : getOrCreateNetwork().members.entrySet())
-				if (wantsPower(entry.getKey(), entry.getValue()))
+			for (KineticBlockEntity member : getOrCreateNetwork().members.keySet())
+				if (wantsPower(member))
 					return true;
 			return false;
 		}
@@ -780,13 +781,34 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 	}
 
 	/**
-	 * Whether one member is a load worth spending air on. The impact test comes before the tag lookup
-	 * because a shaft, a cogwheel, a gearbox and a clutch all sit at zero, and on any real network they
-	 * are most of the blocks.
+	 * Whether one member is worth spending air on.
+	 *
+	 * <p><b>Classified, not measured, and the measured version was a regression.</b> The first cut asked
+	 * whether the block draws stress, which reads as obviously right and is wrong: Create registers
+	 * {@code belt} with {@code setNoImpact}, and {@code gantry_shaft}, {@code flywheel} and
+	 * {@code display_board} are zero too. A belt network is the most ordinary load in the game and draws
+	 * nothing, so an engine keyed on impact would sit and watch a base go dark while still spinning up
+	 * for a bare shaft. Stress tells you how <em>big</em> a load is, not whether something is a load.
+	 *
+	 * <p>So the question is asked the other way round, against {@link CAESTags#KINETIC_RELAY}: is this
+	 * block nothing but a pipe for rotation? Everything else counts, which is the safe default — an
+	 * unknown block gets driven, exactly as it did before this guard existed.
+	 *
+	 * <p>Stores are skipped for the same reason their capacity is, and the Air Engine is itself in
+	 * {@link CAESTags#KINETIC_ENERGY_STORAGE}, so one rule covers this mod's own engines and every other
+	 * mod's store: an engine must not spend air to fund a peer's compression.
+	 *
+	 * <p>Reads nothing but the block state, deliberately. An earlier version called
+	 * {@code calculateStressApplied()} on each member, which is not a query: it assigns
+	 * {@code lastStressApplied}, a field Create persists as {@code AddedStress} and re-seeds the network
+	 * from through {@code addSilently}. A predicate meant to observe the network was writing to every
+	 * block it visited.
 	 */
-	private boolean wantsPower(KineticBlockEntity member, float impact) {
-		return member != this && !member.isRemoved() && impact > 0
-			&& !member.getBlockState().is(CAESTags.KINETIC_ENERGY_STORAGE);
+	private boolean wantsPower(KineticBlockEntity member) {
+		if (member == this || member.isRemoved())
+			return false;
+		BlockState state = member.getBlockState();
+		return !state.is(CAESTags.KINETIC_RELAY) && !state.is(CAESTags.KINETIC_ENERGY_STORAGE);
 	}
 
 	/**
@@ -814,7 +836,7 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 			if (++visited > DEMAND_WALK_LIMIT)
 				return true;
 			KineticBlockEntity current = queue.poll();
-			if (current != this && wantsPower(current, current.calculateStressApplied()))
+			if (wantsPower(current))
 				return true;
 			for (KineticBlockEntity neighbour : connectedNeighboursOf(current))
 				if (seen.add(neighbour.getBlockPos()))

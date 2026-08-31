@@ -40,6 +40,26 @@ public final class CAESTags {
 	public static final TagKey<Block> KINETIC_ENERGY_STORAGE = TagKey.create(Registries.BLOCK,
 		ResourceLocation.fromNamespaceAndPath("c", "kinetic_energy_storage"));
 
+	/**
+	 * Kinetic blocks that only pass rotation along — a shaft, a cogwheel, a gearbox, a clutch — as
+	 * opposed to anything that does work when it turns.
+	 *
+	 * <p><b>A tag, and a default-allow one, because Create does not model this and stress cannot stand
+	 * in for it.</b> The obvious test is "does it draw stress", and it is wrong: {@code belt} is
+	 * registered {@code setNoImpact}, and so are {@code gantry_shaft}, {@code flywheel} and
+	 * {@code display_board}. A belt network is the canonical Create load and draws exactly zero, so an
+	 * engine keyed on stress would have refused to carry the most ordinary base there is — while still
+	 * spinning up for a bare shaft, which also draws zero. Stress separates *big* loads from small ones,
+	 * not loads from plumbing.
+	 *
+	 * <p>So membership is listed rather than derived, and the default is the safe direction: anything
+	 * <em>not</em> in here counts as worth driving. A block this mod has never heard of gets driven,
+	 * which is how it behaved before; only the handful of blocks known to do nothing but relay are
+	 * excluded. A pack or another addon adds its own relay with a datapack.
+	 */
+	public static final TagKey<Block> KINETIC_RELAY = TagKey.create(Registries.BLOCK,
+		ResourceLocation.fromNamespaceAndPath("c", "kinetic_relay"));
+
 	private CAESTags() {
 		throw new AssertionError("No instances");
 	}

@@ -503,12 +503,29 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   gearing are not guessable. `DEMAND_WALK_LIMIT` caps it, and the cap fails *towards the old
   behaviour* — a component bigger than the cap with no load found in it is treated as a load, rather
   than risking an engine that refuses to carry a large base.
-- **Latent impact, never `networkStressWithoutSelf()`.** Create scales stress by speed —
-  `getActualStressOf` multiplies the recorded impact by `|getTheoreticalSpeed()|` — so on a network
-  nothing is turning, every member reports zero stress however much machinery is bolted to it. Testing
-  the stress total would have read "no load" at exactly the moment an engine is deciding whether to take
-  over, and failover would never have happened again. `calculateStressApplied()` is a flat lookup of the
-  block's impact and does not depend on speed, which is why the walk asks each block that.
+- **Stress cannot answer "is this a load", and a build that thought it could shipped for one review
+  cycle.** Two reasons, the second worse. First, Create scales stress by speed: `getActualStressOf`
+  multiplies the recorded impact by `|getTheoreticalSpeed()|`, so on a network nothing is turning every
+  member reports zero however much machinery is attached — testing the *total* reads "no load" at
+  exactly the moment a store decides whether to take over, and failover never happens again. Second,
+  and the killer: **`belt` is registered `setNoImpact`**, and so are `gantry_shaft`, `flywheel` and
+  `display_board`. A belt network is the most ordinary load in Create and draws exactly zero, so even
+  per-block impact is not a load test — an engine keyed on it sat and watched a base go dark while
+  still spinning up for a bare shaft. Stress tells you how *big* a load is, never whether something
+  is one.
+- **So `c:kinetic_relay` asks the question backwards, and is deliberately default-allow.** The tag lists
+  the blocks that do nothing but pass rotation along — shaft, cogwheel, gearbox, clutch, gearshift,
+  chain drive, the encased variants, the gauges — and everything not in it counts as worth driving.
+  That direction is the point: a block this mod has never heard of gets driven, exactly as it did before
+  the guard existed, so the failure mode is the old behaviour rather than a base that will not run.
+  `gantry_shaft` and `powered_shaft` are deliberately *not* relays. Shared with Create: Gravity
+  Batteries, which ships the same tag; block tags merge additively, so the duplicate entries are
+  harmless and neither mod depends on the other.
+- **The demand predicate reads block states and nothing else, and that is a correctness rule.** An
+  earlier version called `calculateStressApplied()` on each member to get its impact. That is not a
+  query: it assigns `lastStressApplied`, which Create persists as the `AddedStress` NBT key and re-seeds
+  the network from through `addSilently`. So a predicate meant to *observe* the network was writing to
+  every block it visited. Never call a `calculate*` method on a block you do not own.
 - **The demand walk needs no exemption for Air Engines, and that is the tag paying for itself.** The
   Air Engine is in `c:kinetic_energy_storage`, so the one rule that skips stores covers this mod's own
   engines and every other mod's store alike — an engine must not spend air to fund a peer's
