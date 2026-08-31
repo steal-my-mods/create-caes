@@ -31,7 +31,15 @@ public enum IdleReason {
 	 * different blocks. Classified by the {@code c:kinetic_energy_storage} tag, so it covers addons
 	 * this one has never heard of.
 	 */
-	NETWORK_ON_STORED_POWER("network_on_stored_power");
+	NETWORK_ON_STORED_POWER("network_on_stored_power"),
+	/**
+	 * Nothing else on the network can turn it, and nothing on it wants turning — a bare shaft, a
+	 * cogwheel, a disengaged clutch. The engine is holding its air rather than spending it into
+	 * something that would do no work with it. Reported ahead of {@link #NOT_TURNING}, which is also
+	 * true in this state but tells a player the opposite of what is happening: the shaft is still
+	 * because the engine chose to hold, not because it is waiting for a generator.
+	 */
+	NOTHING_TO_DRIVE("nothing_to_drive");
 
 	private final String name;
 

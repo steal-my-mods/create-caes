@@ -31,6 +31,14 @@ as it did.
   storage to cost something, and it was never what stopped one store charging another. **Existing
   worlds keep 0.7**, since the value is already written to their server config — delete the line, or
   set it to 1.0, to pick up the new default.
+- **An engine no longer spends air into a network where nothing is drawing.** Reported from play:
+  attaching a bare shaft to a charged engine started it generating and it emptied its vessel driving
+  nothing. A cogwheel did it too, and so did a *disengaged* clutch. The guard that was supposed to
+  prevent this asked whether a shaft was attached, which is a much weaker question than whether
+  anything wants power; it now measures the stress the network would actually draw. An engine holding
+  for this reason says "Nothing needs power" rather than reporting the shaft as unpowered. Note a
+  network of nothing but Air Engines asks for nothing, by the same rule that stops one engine
+  compressing off another.
 - Goggles distinguish the two shortfalls: an engine that will not compress because the surplus is
   coming from some *other* mod's store says so, rather than reporting the network as short.
 - **A Pressure Vessel can still buffer between two networks, and that is the point of the rule being

@@ -472,6 +472,56 @@ Releases go out through `publishMods` (`me.modmuss50.mod-publish-plugin`), drive
   their own multiblocks and never merge with Create's Fluid Tanks, even though both implement the
   same interface. That is why subclassing `FluidTankBlockEntity` was not necessary.
 
+- **`hasSomethingToDrive()` asks whether anything wants power, and asking whether a shaft is *present*
+  was a bug reported from play.** Attaching a bare shaft to a charged engine started it generating and
+  it emptied its vessel driving nothing; a clutch did it too, and that is the clearest case, because a
+  disengaged clutch splits the network — the engine's whole world was itself and a clutch passing
+  nothing through. The guard's own comment always said it existed so that "a charged engine sitting in
+  a chest room would not spin itself against nothing"; a chest room had simply been implemented as *no
+  kinetic neighbour* rather than *no demand*. Create: Gravity Batteries had the identical bug through
+  the identical line, and both are fixed the same way.
+- **A test asserted the old behaviour, and it was the test that was wrong.**
+  `anUnloadedMotorStillSpendsAir` said in as many words that "a bare shaft is still something to
+  drive", on the reasoning that without that floor "a charged vessel is a perpetual motion machine:
+  rotation for nothing, for ever". That reasoning does not hold — declining to spend air is not
+  perpetual motion, it is not spending, and nothing is created either way. It is now
+  `aChargedEngineOnABareShaftHoldsItsAir` and asserts the opposite. `anEngineDrivingNothingStaysIdle`
+  passed throughout and is exactly why the bug survived: an *empty* shaft face was already handled,
+  and a face with a shaft on it was not.
+- **A stopped Create network does not exist, and that is what makes the demand test hard.**
+  `KineticBlockEntity.network` is only ever assigned from `setSource` — which copies it off a block that
+  already has one — or by a generator asserting itself, and `clearKineticInformation` nulls it. So every
+  block on a shaft run with nothing driving it has `network == null` and there is **no member map to
+  walk**. The member map only serves the branch taken while the engine is already carrying the base;
+  the rest of the time `walkForSomethingThatWantsPower` walks the topology itself.
+- **The topology walk is Create's own, reassembled from its public parts.**
+  `RotationPropagator.getConnectedNeighbours` is private, but the two things it is built from are not:
+  `KineticBlockEntity#addPropagationLocations` for the candidate positions — which carries a block's own
+  idea of what it reaches, including large-cog diagonals and any addon's custom connections — and
+  `RotationPropagator.isConnected` for the edge test. Composing those two agrees with the propagator by
+  construction. Do not hand-roll the connection rules instead; cogwheel meshing and large-to-small
+  gearing are not guessable. `DEMAND_WALK_LIMIT` caps it, and the cap fails *towards the old
+  behaviour* — a component bigger than the cap with no load found in it is treated as a load, rather
+  than risking an engine that refuses to carry a large base.
+- **Latent impact, never `networkStressWithoutSelf()`.** Create scales stress by speed —
+  `getActualStressOf` multiplies the recorded impact by `|getTheoreticalSpeed()|` — so on a network
+  nothing is turning, every member reports zero stress however much machinery is bolted to it. Testing
+  the stress total would have read "no load" at exactly the moment an engine is deciding whether to take
+  over, and failover would never have happened again. `calculateStressApplied()` is a flat lookup of the
+  block's impact and does not depend on speed, which is why the walk asks each block that.
+- **The demand walk needs no exemption for Air Engines, and that is the tag paying for itself.** The
+  Air Engine is in `c:kinetic_energy_storage`, so the one rule that skips stores covers this mod's own
+  engines and every other mod's store alike — an engine must not spend air to fund a peer's
+  compression. Note this is the opposite of `foreignStoredCapacityOnNetwork()`, which *does* exempt Air
+  Engines by class, because there the coalition already accounts for them.
+- **`load()` in the GameTests is not scaffolding, it is the other half of the guard.** Eleven tests
+  needed a real consumer added before an engine would generate at all, and several said so in their own
+  comments — "a shaft the engine still has something to drive after the motor goes" was the assumption.
+  It is a cogwheel with a fan meshed above rather than a fan on the end of the chain, and the geometry
+  is forced: the engine has one kinetic face, so the whole network hangs off `DRIVER`, and the tests
+  that pull a motor put it at `DRIVER.west()` — a load further west dies with the motor and the failover
+  it exists to survive.
+
 ## The kinetic storage convention
 
 `c:kinetic_energy_storage` is a cross-mod block tag meaning **the capacity this block supplies to a

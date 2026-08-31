@@ -35,6 +35,7 @@
   "createcaes.tooltip.air_engine.idle.no_surplus": "Not enough spare capacity",
   "createcaes.tooltip.air_engine.idle.network_on_air": "Network is already running on stored air",
   "createcaes.tooltip.air_engine.idle.network_on_stored_power": "Network is running on stored power",
+  "createcaes.tooltip.air_engine.idle.nothing_to_drive": "Nothing needs power",
   "createcaes.tooltip.air_engine.needs": "Needs %1$s, %2$s spare",
   "createcaes.ponder.air_engine.header": "Storing surplus power as compressed air",
   "createcaes.ponder.air_engine.text_1": "Pressure Vessels hold Compressed Air. Stack them up to 3x3 wide, as you would a Fluid Tank",

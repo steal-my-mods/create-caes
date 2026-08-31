@@ -243,23 +243,48 @@ public class CAESGameTests {
 	}
 
 	/**
-	 * The engine burns air even when the shaft is unloaded. Without this floor a charged vessel is a
-	 * perpetual motion machine: rotation for nothing, for ever.
+	 * A charged engine on a shaft with nothing drawing on it keeps its air.
+	 *
+	 * <p><b>This test used to assert the opposite</b>, as {@code anUnloadedMotorStillSpendsAir}: "a bare
+	 * shaft is still something to drive". Reported from play, for this mod and for Create: Gravity
+	 * Batteries alike — attaching a bare shaft to a charged engine started it generating and it emptied
+	 * its vessel driving nothing. A clutch did it too, and that is the clearest case, because a
+	 * disengaged clutch splits the network: the engine's whole world was itself and a clutch passing
+	 * nothing through.
+	 *
+	 * <p>The old test's stated reason was that without the floor "a charged vessel is a perpetual motion
+	 * machine: rotation for nothing, for ever", and that reasoning does not hold. Declining to spend air
+	 * is not perpetual motion, it is not spending; nothing is created either way. What the old behaviour
+	 * actually bought was a vessel that drained itself whenever a player left a shaft attached.
+	 *
+	 * <p>{@code anEngineDrivingNothingStaysIdle} covers the neighbouring case — nothing on the shaft
+	 * face at all — and passed throughout, which is exactly why this one was needed: an empty face was
+	 * already handled and a face with a shaft on it was not.
 	 */
 	@GameTest(template = "test_rig", timeoutTicks = 200)
-	public static void anUnloadedMotorStillSpendsAir(GameTestHelper helper) {
+	public static void aChargedEngineOnABareShaftHoldsItsAir(GameTestHelper helper) {
 		rig(helper);
-		// A bare shaft: it turns, but it asks nothing of the network.
+		// A shaft, a cogwheel and a clutch. Not one of the three draws a Stress Unit.
 		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		helper.setBlock(DRIVER.west(), AllBlocks.COGWHEEL.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		helper.setBlock(DRIVER.west().west(), AllBlocks.CLUTCH.getDefaultState()
 			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
 		fill(helper, 8000);
 		int before = air(helper);
 
-		helper.runAfterDelay(SETTLE_TICKS + 20, () -> {
-			helper.assertTrue(engine(helper).getMode() == EngineMode.GENERATING,
-				"a bare shaft is still something to drive");
-			helper.assertTrue(air(helper) < before,
-				"spinning a bare shaft should still cost air; " + air(helper) + "mB of " + before);
+		helper.runAfterDelay(SETTLE_TICKS + 40, () -> {
+			AirEngineBlockEntity engine = engine(helper);
+			// The air is the substance: an engine that spent it has spent it whatever it reports.
+			helper.assertTrue(air(helper) == before,
+				"the engine spent air into a network that draws nothing; " + air(helper) + "mB of "
+					+ before);
+			helper.assertTrue(engine.getMode() == EngineMode.IDLE,
+				"expected it to hold its air, it is " + engine.getMode());
+			helper.assertTrue(engine.getIdleReason() == IdleReason.NOTHING_TO_DRIVE,
+				"an engine holding because nothing wants power should say so rather than report the "
+					+ "shaft as unpowered; it says " + engine.getIdleReason());
 			helper.succeed();
 		});
 	}
@@ -326,8 +351,10 @@ public class CAESGameTests {
 		BlockPos shaft = DRIVER;
 		BlockPos otherEngine = new BlockPos(1, 1, 5);
 		BlockPos otherVessel = new BlockPos(0, 1, 5);
-		helper.setBlock(shaft, AllBlocks.SHAFT.getDefaultState()
-			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		// A cogwheel with a fan branched off it rather than a plain shaft, because a bare shaft is no
+		// longer something an engine will spend air on, and the second engine does not count either --
+		// it is a store, and a store's draw is not demand worth generating for.
+		load(helper);
 		helper.setBlock(otherEngine, CAESBlocks.AIR_ENGINE.get()
 			.defaultBlockState()
 			.setValue(AirEngineBlock.FACING, Direction.WEST));
@@ -429,8 +456,7 @@ public class CAESGameTests {
 		floor(helper);
 		helper.setBlock(VESSEL, vessel());
 		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
-		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
-			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		load(helper);
 		fill(helper, 8000);
 
 		helper.runAfterDelay(SETTLE_TICKS + 12, () -> {
@@ -475,8 +501,7 @@ public class CAESGameTests {
 				helper.setBlock(VESSEL.offset(x, 0, z), vessel());
 		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
 		// A shaft the engine still has something to drive after the motor goes.
-		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
-			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		load(helper);
 		BlockPos motor = DRIVER.west();
 		helper.setBlock(motor, AllBlocks.CREATIVE_MOTOR.getDefaultState()
 			.setValue(BlockStateProperties.FACING, Direction.EAST));
@@ -516,8 +541,7 @@ public class CAESGameTests {
 		// One block, so tier 1: the engine may never declare more than 16 RPM.
 		helper.setBlock(VESSEL, vessel());
 		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
-		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
-			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		load(helper);
 		BlockPos motor = DRIVER.west();
 		helper.setBlock(motor, AllBlocks.CREATIVE_MOTOR.getDefaultState()
 			.setValue(BlockStateProperties.FACING, Direction.EAST));
@@ -597,8 +621,7 @@ public class CAESGameTests {
 		helper.setBlock(VESSEL, vessel());
 		helper.setBlock(ENGINE, engineFacing(Direction.EAST));
 		// A shaft between motor and engine, so pulling the motor still leaves something to drive.
-		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
-			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		load(helper);
 		BlockPos motor = DRIVER.west();
 		helper.setBlock(motor, AllBlocks.CREATIVE_MOTOR.getDefaultState()
 			.setValue(BlockStateProperties.FACING, Direction.EAST));
@@ -1094,8 +1117,7 @@ public class CAESGameTests {
 	@GameTest(template = "test_rig", timeoutTicks = 300)
 	public static void anEngineNeverDrainsAPartialStroke(GameTestHelper helper) {
 		rig(helper);
-		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
-			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		load(helper);
 		// Not a whole number of strokes, so the run has to end on one it cannot afford.
 		fill(helper, 100);
 
@@ -1142,8 +1164,7 @@ public class CAESGameTests {
 	@GameTest(template = "test_rig", timeoutTicks = 300)
 	public static void anEmptyVesselNeverStartsGenerating(GameTestHelper helper) {
 		rig(helper);
-		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
-			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		load(helper);
 
 		int[] blips = { 0 };
 		for (int i = 1; i <= FLAP_SAMPLE_TICKS; i++)
@@ -1180,8 +1201,7 @@ public class CAESGameTests {
 	@GameTest(template = "test_rig", timeoutTicks = 200)
 	public static void anEngineWillNotStartAStrokeItCannotPayFor(GameTestHelper helper) {
 		rig(helper);
-		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
-			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		load(helper);
 		// Less than one stroke: a tier-1 engine on a one-block vessel wants about 4mB a tick.
 		fill(helper, 2);
 
@@ -1290,6 +1310,14 @@ public class CAESGameTests {
 		helper.setBlock(smallEngine, engineFacing(Direction.EAST));
 		helper.setBlock(smallVessel, vessel());
 
+		// And something on the network that actually wants turning, meshed onto the cogwheel stack a
+		// level higher. Without it none of the three engines generates at all: engines are stores, and
+		// a store's draw is not demand worth generating for, so a network of nothing but engines,
+		// shafts and cogwheels asks for nothing. See aChargedEngineOnABareShaftHoldsItsAir.
+		helper.setBlock(new BlockPos(4, 3, 5), cogwheel());
+		helper.setBlock(new BlockPos(5, 3, 5), AllBlocks.ENCASED_FAN.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
+
 		int charge = 40000;
 		tankAt(helper, westVessel).fill(new FluidStack(CAESFluids.COMPRESSED_AIR.get(), charge),
 			FluidAction.EXECUTE);
@@ -1362,12 +1390,16 @@ public class CAESGameTests {
 		helper.setBlock(new BlockPos(2, 3, 4), AllBlocks.CREATIVE_MOTOR.getDefaultState()
 			.setValue(BlockStateProperties.FACING, Direction.DOWN));
 
-		// The discharging side: an engine on the vessel's north wall with a shaft to drive and
-		// nothing at all to drive it. Its own network, with no source and no capacity of its own.
+		// The discharging side: an engine on the vessel's north wall with a shaft, and a fan on the end
+		// of it so there is something that actually wants turning. Its own network, with no source and
+		// no capacity of its own. The fan is not decoration: a bare shaft is no longer something an
+		// engine will spend air on -- see aChargedEngineOnABareShaftHoldsItsAir.
 		BlockPos discharger = new BlockPos(2, 1, 2);
 		helper.setBlock(discharger, engineFacing(Direction.SOUTH));
 		helper.setBlock(new BlockPos(2, 1, 1), AllBlocks.SHAFT.getDefaultState()
 			.setValue(BlockStateProperties.AXIS, Direction.Axis.Z));
+		helper.setBlock(new BlockPos(2, 1, 0), AllBlocks.ENCASED_FAN.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.NORTH));
 
 		// Enough to start a stroke on, so the discharging side does not spend the test waiting for
 		// the charging side to hand it a first whole one.
@@ -1512,8 +1544,7 @@ public class CAESGameTests {
 	public static void anEnginesOwnAirIsNotCountedAsBorrowedCapacity(GameTestHelper helper) {
 		rig(helper);
 		// A bare shaft, so the engine is the network's only possible source and starts generating.
-		helper.setBlock(DRIVER, AllBlocks.SHAFT.getDefaultState()
-			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		load(helper);
 		fill(helper, 8000);
 
 		helper.runAfterDelay(SETTLE_TICKS + 20, () -> {
@@ -1526,6 +1557,31 @@ public class CAESGameTests {
 					+ "the scan claimed " + be.foreignStoredCapacityOnNetwork() + " was borrowed");
 			helper.succeed();
 		});
+	}
+
+	/**
+	 * A cogwheel where the plain shaft used to go, with an Encased Fan meshed onto it from above —
+	 * something on the network that actually wants turning.
+	 *
+	 * <p>Needed by every test that expects the engine to generate, because since
+	 * {@code aChargedEngineOnABareShaftHoldsItsAir} an engine declines to spend air into a network where
+	 * nothing is drawing. The rig used to get its generation for free from a bare shaft, and several
+	 * tests said so in as many words — "a shaft the engine still has something to drive after the motor
+	 * goes" was the assumption this replaces.
+	 *
+	 * <p>A cogwheel with a branch rather than a fan on the end of the chain, and the geometry is forced.
+	 * The engine has one kinetic face, so the whole network hangs off {@link #DRIVER}; the tests that
+	 * pull a motor put it at {@code DRIVER.west()}, so a load further west dies with the motor and the
+	 * failover it is supposed to survive. Meshing a second cogwheel above {@code DRIVER} puts the load
+	 * on a branch that outlives anything happening on the main line.
+	 */
+	private static void load(GameTestHelper helper) {
+		helper.setBlock(DRIVER, AllBlocks.COGWHEEL.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		helper.setBlock(DRIVER.above(), AllBlocks.COGWHEEL.getDefaultState()
+			.setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+		helper.setBlock(DRIVER.above().east(), AllBlocks.ENCASED_FAN.getDefaultState()
+			.setValue(BlockStateProperties.FACING, Direction.EAST));
 	}
 
 	private static void floor(GameTestHelper helper) {

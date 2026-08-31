@@ -1,9 +1,14 @@
 package com.createcaes.engine;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Deque;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import com.createcaes.CAESConfig;
 import com.createcaes.CAESLang;
@@ -11,6 +16,7 @@ import com.createcaes.registry.CAESFluids;
 import com.createcaes.registry.CAESTags;
 import com.createcaes.vessel.PressureVesselBlockEntity;
 import com.simibubi.create.content.kinetics.KineticNetwork;
+import com.simibubi.create.content.kinetics.RotationPropagator;
 import com.simibubi.create.content.kinetics.base.GeneratingKineticBlockEntity;
 import com.simibubi.create.content.kinetics.base.IRotate;
 import com.simibubi.create.content.kinetics.base.KineticBlockEntity;
@@ -139,6 +145,12 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 	 * changes shape without any engine's network id changing with it.
 	 */
 	private static final int COALITION_REFRESH_TICKS = 20;
+
+	/**
+	 * Blocks the demand walk will visit before giving up and assuming there is a load. See
+	 * {@link #walkForSomethingThatWantsPower()} for why the cap fails in that direction.
+	 */
+	private static final int DEMAND_WALK_LIMIT = 256;
 
 	private EngineMode mode = EngineMode.IDLE;
 	private IdleReason idleReason = IdleReason.NONE;
@@ -619,11 +631,12 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 
 		float headroom = networkCapacityWithoutSelf() - networkStressWithoutSelf();
 
-		// Nothing else on this network can turn it, and there is something attached worth turning.
-		// The second half matters: without it a charged engine sitting in a chest room would spin
-		// itself against nothing and quietly empty its vessel.
-		boolean soleSource =
-			!hasSource() && networkCapacityWithoutSelf() <= 0 && hasSomethingToDrive();
+		// Nothing else on this network can turn it, and something on the network actually wants
+		// turning. The second half matters: without it a charged engine sitting in a chest room would
+		// spin itself against nothing and quietly empty its vessel -- which is what it did, because it
+		// used to ask whether a shaft was attached rather than whether anything was drawing.
+		boolean couldTakeOver = !hasSource() && networkCapacityWithoutSelf() <= 0;
+		boolean soleSource = couldTakeOver && hasSomethingToDrive();
 
 		// The deficit has to be the network's own, not one the coalition dug for it. The
 		// self-excluded headroom is still the second half of the test, because that is what shares
@@ -655,6 +668,13 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 			idleReason = IdleReason.NONE;
 			return EngineMode.GENERATING;
 		}
+
+		// Nothing else can turn this network and nothing on it wants turning. Reported ahead of
+		// NOT_TURNING, which is true here but says the opposite of what a player needs to hear: the
+		// shaft is still because the engine is deliberately holding its air, not because it is waiting
+		// for a generator.
+		if (couldTakeOver)
+			return idleWithoutCompressing(IdleReason.NOTHING_TO_DRIVE);
 
 		float speed = Math.abs(getTheoreticalSpeed());
 		if (speed == 0)
@@ -716,14 +736,122 @@ public class AirEngineBlockEntity extends GeneratingKineticBlockEntity {
 		return ratingPerRpm() * Math.abs(getTheoreticalSpeed());
 	}
 
-	/** Whether the shaft side actually has a kinetic block on it that would take the rotation. */
+	/**
+	 * Whether anything on this network actually wants power.
+	 *
+	 * <p>This used to ask whether the shaft side held a kinetic block, which is a different question
+	 * and a much weaker one. Reported from play: attaching a bare shaft to a charged engine started it
+	 * generating and it emptied its vessel driving nothing. A clutch did it too, and that is the
+	 * clearest case — a disengaged clutch splits the network, so the engine's whole world was itself and
+	 * a clutch passing nothing through. The guard's own comment always said it existed so that "a
+	 * charged engine sitting in a chest room would not spin itself against nothing"; a chest room had
+	 * simply been implemented as <em>no kinetic neighbour</em> rather than <em>no demand</em>.
+	 *
+	 * <p>Latent impact, not {@link #networkStressWithoutSelf()}. Create scales stress by speed —
+	 * {@code getActualStressOf} multiplies the recorded impact by {@code |getTheoreticalSpeed()|} — so on
+	 * a network nothing is turning, every member reports zero stress however much machinery is bolted to
+	 * it. Testing the stress total would have read "no load" at exactly the moment an engine decides
+	 * whether to take over, and failover would never have happened again.
+	 *
+	 * <p><b>A stopped Create network does not exist</b>, which is what makes this harder than it looks.
+	 * {@code KineticBlockEntity.network} is only ever assigned from {@code setSource}, which copies it
+	 * off a block that already has one, or by a generator asserting itself — and
+	 * {@code clearKineticInformation} nulls it. So every block on a shaft run with nothing driving it has
+	 * {@code network == null} and there is no member map to consult. The member map is only good for the
+	 * branch taken while this engine is already carrying the base; the rest of the time the topology has
+	 * to be walked.
+	 *
+	 * <p>Stores are skipped for the same reason their capacity is — see
+	 * {@link #foreignStoredCapacityOnNetwork()}. Note this one does <em>not</em> exempt Air Engines by
+	 * class, because it does not need to: the Air Engine is itself in
+	 * {@link CAESTags#KINETIC_ENERGY_STORAGE}, so one rule covers this mod's own engines and every other
+	 * mod's store. An engine must not spend its air to fund a peer's compression.
+	 */
 	private boolean hasSomethingToDrive() {
-		Direction shaftSide = AirEngineBlock.getFacing(getBlockState())
-			.getOpposite();
-		BlockPos neighbour = worldPosition.relative(shaftSide);
-		BlockState state = level.getBlockState(neighbour);
-		return state.getBlock() instanceof IRotate rotate
-			&& rotate.hasShaftTowards(level, neighbour, state, shaftSide.getOpposite());
+		if (level == null)
+			return false;
+		if (hasNetwork()) {
+			for (Map.Entry<KineticBlockEntity, Float> entry : getOrCreateNetwork().members.entrySet())
+				if (wantsPower(entry.getKey(), entry.getValue()))
+					return true;
+			return false;
+		}
+		return walkForSomethingThatWantsPower();
+	}
+
+	/**
+	 * Whether one member is a load worth spending air on. The impact test comes before the tag lookup
+	 * because a shaft, a cogwheel, a gearbox and a clutch all sit at zero, and on any real network they
+	 * are most of the blocks.
+	 */
+	private boolean wantsPower(KineticBlockEntity member, float impact) {
+		return member != this && !member.isRemoved() && impact > 0
+			&& !member.getBlockState().is(CAESTags.KINETIC_ENERGY_STORAGE);
+	}
+
+	/**
+	 * Walks the kinetic topology looking for one block that would draw stress.
+	 *
+	 * <p>Faithful rather than approximate, because guessing at Create's connection rules would mean
+	 * missing cogwheel meshing, large-to-small gearing and every custom connection an addon adds.
+	 * {@code RotationPropagator.getConnectedNeighbours} is private, but the two pieces it is built from
+	 * are public — {@code addPropagationLocations} for the candidate positions, which carries a block's
+	 * own idea of what it reaches, and {@code isConnected} for the edge test. This is those two composed
+	 * the same way, so it agrees with the propagator by construction.
+	 *
+	 * <p>Capped, and the cap fails <em>towards the old behaviour</em>: a component larger than
+	 * {@link #DEMAND_WALK_LIMIT} blocks with no load found in it is treated as a load rather than risking
+	 * an engine that refuses to carry a large base. Reaching the cap needs a few hundred kinetic blocks
+	 * that all draw nothing, which is a shaft sculpture rather than a factory.
+	 */
+	private boolean walkForSomethingThatWantsPower() {
+		Set<BlockPos> seen = new HashSet<>();
+		Deque<KineticBlockEntity> queue = new ArrayDeque<>();
+		seen.add(worldPosition);
+		queue.add(this);
+		int visited = 0;
+		while (!queue.isEmpty()) {
+			if (++visited > DEMAND_WALK_LIMIT)
+				return true;
+			KineticBlockEntity current = queue.poll();
+			if (current != this && wantsPower(current, current.calculateStressApplied()))
+				return true;
+			for (KineticBlockEntity neighbour : connectedNeighboursOf(current))
+				if (seen.add(neighbour.getBlockPos()))
+					queue.add(neighbour);
+		}
+		return false;
+	}
+
+	/** {@code RotationPropagator.getConnectedNeighbours}, which is private, out of its public parts. */
+	private List<KineticBlockEntity> connectedNeighboursOf(KineticBlockEntity be) {
+		List<KineticBlockEntity> found = new ArrayList<>();
+		BlockPos pos = be.getBlockPos();
+		if (!level.isLoaded(pos))
+			return found;
+		List<BlockPos> candidates = new ArrayList<>();
+		for (Direction face : Direction.values()) {
+			BlockPos relative = pos.relative(face);
+			// Create's own propagator declines unloaded positions rather than force-loading a chunk,
+			// and declining is the conservative direction here too.
+			if (level.isLoaded(relative))
+				candidates.add(relative);
+		}
+		if (be.getBlockState().getBlock() instanceof IRotate rotate)
+			candidates = be.addPropagationLocations(rotate, be.getBlockState(), candidates);
+		for (BlockPos candidate : candidates) {
+			if (!level.isLoaded(candidate))
+				continue;
+			BlockState state = level.getBlockState(candidate);
+			if (!(state.getBlock() instanceof IRotate) || !state.hasBlockEntity())
+				continue;
+			if (!(level.getBlockEntity(candidate) instanceof KineticBlockEntity neighbour))
+				continue;
+			if (RotationPropagator.isConnected(be, neighbour)
+				|| RotationPropagator.isConnected(neighbour, be))
+				found.add(neighbour);
+		}
+		return found;
 	}
 
 	private void setMode(EngineMode next) {
